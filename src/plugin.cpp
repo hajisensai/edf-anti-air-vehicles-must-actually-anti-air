@@ -1,8 +1,9 @@
 // EDF6AutoTurret: a Vehicle603_Flak whose guns carry a lock-on profile (LockonType != 0)
 // slews its turret onto the guns' current lock target by itself, preferring air targets.
 // The rider keeps the trigger; moving the aim stick takes the turret back for a moment.
-// It also time-fuses the guns' shells to the target's range, and lets LockonType 4 guns fire
-// without a lock (stock fire-start refuses lock-on weapons with an empty lock list).
+// It also time-fuses the guns' shells to the target's range, proximity-fuses them near any locked
+// target, and lets LockonType 4 guns fire without a lock (stock fire-start refuses lock-on
+// weapons with an empty lock list).
 // All addresses are RVAs into EDF.dll TimeDateStamp 0x678CCB46; see docs/re-notes.md.
 #include <Windows.h>
 #include <cmath>
@@ -39,6 +40,8 @@ struct Config {
     bool fuse=true;            // set each round's lifetime (its burst point) to the target's range
     float fuseBias=0.0f;       // frames added to the computed fuse
     int fuseMin=4;             // never burst closer than this many frames
+    float proximity=6.0f;      // burst when a round passes this close to a locked target (0 = off)
+    bool contact=true;         // burst the moment a round sticks to something or stops
 };
 Config cfg{};
 FILETIME iniStamp{};
@@ -68,6 +71,42 @@ constexpr float kPi=3.14159265f;
 using InputFn=void(__fastcall*)(void*,std::uintptr_t);
 InputFn originalInput=nullptr;
 
+// GrenadeBullet01 (the flak round): slot 1 deleting dtor, slot 5 per-frame update.
+constexpr unsigned kGrenadeVtable=0x17A17E0,kGrenadeDtor=0x265B10,kGrenadeUpdate=0x264AB0;
+constexpr std::size_t kGrenadeDtorSlot=1,kGrenadeUpdateSlot=5;
+// Weapon slot 17 = "round spawned" (weapon, bullet), called once per round by fire 0x696FD0.
+constexpr std::size_t kSpawnSlot=17;
+// Bullet: weak-this control block, and the flight control block C at +0x140 with its flags,
+// age/lifetime in frames (expires when age >= lifetime, 0x236899), position, velocity (m/s)
+// and the stuck-to-something byte.
+constexpr std::size_t kBulletWeakCtrl=0x30,kCtl=0x140;
+constexpr std::size_t kCtlFlags=0xAF4,kCtlAge=0xAF8,kCtlAlive=0xA08,kCtlPos=0xB80,kCtlVel=0xB90,kCtlStuck=0xC00;
+constexpr std::uint32_t kRoundDead=0x1,kRoundBurstOnExpiry=0x20;
+constexpr float kStoppedSpeed=60.0f;     // m/s; the flak leaves the barrel at ~480
+
+using SpawnFn=void(__fastcall*)(void*,void*);
+using UpdateFn=void(__fastcall*)(void*,void*);
+using DtorFn=void*(__fastcall*)(void*,unsigned);
+UpdateFn originalUpdate=nullptr;
+DtorFn originalDtor=nullptr;
+struct SpawnPatch { const void* vtable; SpawnFn original; };
+SpawnPatch spawnPatches[4]{};
+bool proximityReady=false;
+
+// Rounds fired by our guns, keyed by address and the bullet's own control block (address reuse).
+struct Round { const void* bullet; const void* ctrl; };
+constexpr int kMaxRounds=128;
+Round rounds[kMaxRounds]{};
+int roundNext=0;
+SRWLOCK roundLock=SRWLOCK_INIT;
+
+// Aim points of every lock seen this frame, sampled in the vehicle input phase that runs
+// before the bullet update phase of the same frame.
+struct Mark { const void* info; float pos[3]; ULONGLONG at; };
+constexpr int kMaxMarks=32;
+constexpr ULONGLONG kMarkMs=150;
+Mark marks[kMaxMarks]{};
+
 struct Track {
     const void* vehicle;
     const void* target;
@@ -83,6 +122,7 @@ struct Diag {
     ULONGLONG at;
     unsigned calls,ridden;
     unsigned weapons,locked,listed,invalid,expired;
+    unsigned tagged,proximity,contact;
     const char* stop;
 };
 Diag diag{};
@@ -144,6 +184,128 @@ void ToLocal(const unsigned char* vehicle,const float* world,float* local) noexc
     local[0]=Dot(d,m);local[1]=Dot(d,m+4)-cfg.pivotHeight;local[2]=Dot(d,m+8);
 }
 
+void Remember(const void* info,const float* world) noexcept {
+    Mark* slot=&marks[0];
+    for(auto& m:marks) {
+        if(m.info==info){slot=&m;break;}
+        if(m.at<slot->at)slot=&m;
+    }
+    slot->info=info;std::memcpy(slot->pos,world,sizeof(slot->pos));slot->at=GetTickCount64();
+}
+
+void Tag(const void* bullet) noexcept {
+    const Round round{bullet,At<const void*>(bullet,kBulletWeakCtrl)};
+    AcquireSRWLockExclusive(&roundLock);
+    Round* slot=nullptr;
+    for(auto& r:rounds)if(!r.bullet){slot=&r;break;}
+    if(!slot){slot=&rounds[roundNext];roundNext=(roundNext+1)%kMaxRounds;}   // full: drop the oldest
+    *slot=round;
+    ReleaseSRWLockExclusive(&roundLock);
+    ++diag.tagged;
+}
+
+void Untag(const void* bullet) noexcept {
+    AcquireSRWLockExclusive(&roundLock);
+    for(auto& r:rounds)if(r.bullet==bullet)r=Round{};
+    ReleaseSRWLockExclusive(&roundLock);
+}
+
+bool Tagged(const void* bullet) noexcept {
+    const void* ctrl=At<const void*>(bullet,kBulletWeakCtrl);
+    bool found=false;
+    AcquireSRWLockShared(&roundLock);
+    for(auto& r:rounds)if(r.bullet==bullet && r.ctrl==ctrl){found=true;break;}
+    ReleaseSRWLockShared(&roundLock);
+    return found;
+}
+
+void __fastcall SpawnHook(void* weapon,void* bullet) {
+    const void* vtable=*static_cast<void**>(weapon);
+    for(auto& p:spawnPatches)if(p.vtable==vtable){if(p.original)p.original(weapon,bullet);break;}
+    __try {
+        // Only our guns: LockonType 4 is unused by stock weapons (see PatchFireGate).
+        if(bullet && At<std::int32_t>(weapon,kLockonType)==4 && *static_cast<void**>(bullet)==image+kGrenadeVtable)
+            Tag(bullet);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+bool PatchVtableSlot(void** slot,void* expected,void* replacement) noexcept;
+
+// Route the gun class's "round spawned" slot through SpawnHook, once per vtable.
+void HookSpawn(const unsigned char* weapon) noexcept {
+    if(!proximityReady)return;
+    const auto vtable=At<void**>(weapon,0);
+    SpawnPatch* free=nullptr;
+    for(auto& p:spawnPatches) {
+        if(p.vtable==vtable)return;
+        if(!p.vtable && !free)free=&p;
+    }
+    if(!free || !Readable(vtable+kSpawnSlot,8))return;
+    void* original=vtable[kSpawnSlot];
+    free->original=reinterpret_cast<SpawnFn>(original);free->vtable=vtable;
+    const bool ok=PatchVtableSlot(vtable+kSpawnSlot,original,reinterpret_cast<void*>(&SpawnHook));
+    Log("HOOK spawn vtable=+0x%llX original=+0x%llX ok=%d",
+        static_cast<unsigned long long>(reinterpret_cast<const unsigned char*>(vtable)-image),
+        static_cast<unsigned long long>(static_cast<unsigned char*>(original)-image),ok);
+}
+
+// Closest approach of this frame's flight segment to a recent lock aim point.
+bool NearTarget(const float* pos,const float* step,float* burst) noexcept {
+    const auto now=GetTickCount64();
+    const float stepLength=Dot(step,step);
+    for(const auto& m:marks) {
+        if(!m.info || now-m.at>kMarkMs)continue;
+        const float d[3]={m.pos[0]-pos[0],m.pos[1]-pos[1],m.pos[2]-pos[2]};
+        const float t=stepLength>1e-6f ? Clamp(Dot(d,step)/stepLength,0.0f,1.0f) : 0.0f;
+        const float q[3]={pos[0]+step[0]*t,pos[1]+step[1]*t,pos[2]+step[2]*t};
+        const float e[3]={m.pos[0]-q[0],m.pos[1]-q[1],m.pos[2]-q[2]};
+        if(Dot(e,e)<cfg.proximity*cfg.proximity){std::memcpy(burst,q,sizeof(q));return true;}
+    }
+    return false;
+}
+
+// Runs before the round's own update: a fused round gets its age set to its lifetime, so the
+// stock expiry check in the same update bursts it at its (moved) position.
+void Fuze(unsigned char* bullet) noexcept {
+    unsigned char* c=bullet+kCtl;
+    const auto flags=At<std::uint32_t>(c,kCtlFlags);
+    if(flags&kRoundDead)return;
+    const auto age=At<std::int32_t>(c,kCtlAge),alive=At<std::int32_t>(c,kCtlAlive);
+    if(age<cfg.fuseMin || age>=alive)return;
+    float pos[3],vel[3];
+    for(int i=0;i<3;++i){pos[i]=At<float>(c,kCtlPos+i*4);vel[i]=At<float>(c,kCtlVel+i*4);}
+    bool burst=false;
+    if(cfg.contact && (c[kCtlStuck] || Dot(vel,vel)<kStoppedSpeed*kStoppedSpeed)){burst=true;++diag.contact;}
+    if(!burst && cfg.proximity>0.0f) {
+        const float step[3]={vel[0]/60.0f,vel[1]/60.0f,vel[2]/60.0f};
+        float at[3];
+        if(NearTarget(pos,step,at)) {
+            burst=true;++diag.proximity;
+            for(int i=0;i<3;++i)Put<float>(c,kCtlPos+i*4,at[i]);
+        }
+    }
+    if(!burst)return;
+    Put<std::uint32_t>(c,kCtlFlags,flags|kRoundBurstOnExpiry);
+    Put<std::int32_t>(c,kCtlAge,alive);
+}
+
+void __fastcall UpdateHook(void* bullet,void* ctx) {
+    bool ours=false;
+    __try {
+        ours=cfg.enabled && Tagged(bullet);
+        if(ours)Fuze(static_cast<unsigned char*>(bullet));
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    originalUpdate(bullet,ctx);
+    if(!ours)return;
+    __try { if(At<std::uint32_t>(bullet,kCtl+kCtlFlags)&kRoundDead)Untag(bullet); }
+    __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+void* __fastcall DtorHook(void* bullet,unsigned flags) {
+    Untag(bullet);
+    return originalDtor(bullet,flags);
+}
+
 // Best lock across the seat's guns: any air target beats any ground one, nearest first.
 const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char* seat,bool& armed,float* local,float& speed) noexcept {
     armed=false;speed=0.0f;
@@ -156,6 +318,7 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
         const auto weapon=At<const unsigned char*>(holders[i],kHolderWeapon);
         if(!Readable(weapon,kLockList+0x10) || !At<std::int32_t>(weapon,kLockonType))continue;
         armed=true;++diag.weapons;speed=At<float>(weapon,kAmmoSpeed);
+        HookSpawn(weapon);
         diag.listed+=static_cast<unsigned>(At<std::uint64_t>(weapon,kLockList+8));
         const auto head=At<const unsigned char*>(weapon,kLockList);
         if(!Readable(head,0x10))continue;
@@ -166,6 +329,7 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
             const auto target=At<const unsigned char*>(node,kNodeInfo);
             float world[3],l[3];
             if(!AimPoint(target,world))continue;
+            Remember(target,world);
             ToLocal(vehicle,world,l);
             const float distance=std::sqrt(Dot(l,l));
             const float score=distance+(l[1]>cfg.airHeight ? 0.0f : 1.0e6f);
@@ -263,9 +427,9 @@ void ReloadConfigIfChanged() noexcept;
 void FlushDiag(const void* vehicle) noexcept {
     const auto now=GetTickCount64();
     if(!cfg.debug || now-diag.at<1000)return;
-    if(diag.at)Log("DIAG v=%p calls=%u ridden=%u weapons=%u listed=%u locked=%u invalid=%u expired=%u last=%s",
+    if(diag.at)Log("DIAG v=%p calls=%u ridden=%u weapons=%u listed=%u locked=%u invalid=%u expired=%u rounds=%u prox=%u contact=%u last=%s",
         vehicle,diag.calls,diag.ridden,diag.weapons,diag.listed,diag.locked,diag.invalid,diag.expired,
-        diag.stop?diag.stop:"-");
+        diag.tagged,diag.proximity,diag.contact,diag.stop?diag.stop:"-");
     diag=Diag{};diag.at=now;
 }
 
@@ -337,6 +501,22 @@ bool PatchVtableSlot(void** slot,void* expected,void* replacement) noexcept {
     return ok;
 }
 
+// The proximity fuse rides on GrenadeBullet01's update; it stays off if the layout differs.
+void HookGrenade() noexcept {
+    const auto vtable=reinterpret_cast<void**>(image+kGrenadeVtable);
+    const unsigned char age[]={0x8B,0x8D,0xF8,0x0A,0x00,0x00,0xFF,0xC1};   // mov ecx,[rbp+AF8] / inc ecx
+    const unsigned char expire[]={0x3B,0x8D,0x08,0x0A,0x00,0x00};          // cmp ecx,[rbp+A08]
+    const bool layout=vtable[kGrenadeUpdateSlot]==image+kGrenadeUpdate && vtable[kGrenadeDtorSlot]==image+kGrenadeDtor
+        && Matches(0x236888,age,sizeof(age)) && Matches(0x236899,expire,sizeof(expire));
+    if(!layout){Log("HOOK grenade: unexpected layout, proximity fuse off");return;}
+    originalUpdate=reinterpret_cast<UpdateFn>(image+kGrenadeUpdate);
+    originalDtor=reinterpret_cast<DtorFn>(image+kGrenadeDtor);
+    const bool update=PatchVtableSlot(vtable+kGrenadeUpdateSlot,image+kGrenadeUpdate,reinterpret_cast<void*>(&UpdateHook));
+    const bool dtor=PatchVtableSlot(vtable+kGrenadeDtorSlot,image+kGrenadeDtor,reinterpret_cast<void*>(&DtorHook));
+    proximityReady=update && dtor;
+    Log("HOOK grenade update=%d dtor=%d",update,dtor);
+}
+
 float ReadFloat(const wchar_t* key,float fallback) noexcept {
     wchar_t text[64]{};
     GetPrivateProfileStringW(L"AutoTurret",key,L"",text,64,iniPath);
@@ -362,10 +542,12 @@ void LoadConfig() noexcept {
     next.fuse=GetPrivateProfileIntW(L"AutoTurret",L"FuseToTarget",1,iniPath)!=0;
     next.fuseBias=ReadFloat(L"FuseBiasFrames",next.fuseBias);
     next.fuseMin=GetPrivateProfileIntW(L"AutoTurret",L"FuseMinFrames",next.fuseMin,iniPath);
+    next.proximity=ReadFloat(L"ProximityRadius",next.proximity);
+    next.contact=GetPrivateProfileIntW(L"AutoTurret",L"ContactFuse",1,iniPath)!=0;
     cfg=next;
-    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d override=%.2f/%lums fuse=%d%+.1f min=%d",
+    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d override=%.2f/%lums fuse=%d%+.1f min=%d proximity=%.1f contact=%d",
         cfg.enabled,cfg.debug,cfg.gain,cfg.yawSign,cfg.yawOffset,cfg.pitchSign,cfg.pitchOffset,cfg.pivotHeight,
-        cfg.airHeight,cfg.lead,cfg.overrideDeadzone,cfg.overrideMs,cfg.fuse,cfg.fuseBias,cfg.fuseMin);
+        cfg.airHeight,cfg.lead,cfg.overrideDeadzone,cfg.overrideMs,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact);
 }
 
 FILETIME IniStamp() noexcept {
@@ -403,6 +585,7 @@ extern "C" __declspec(dllexport) bool EDFMLAPI EML6_Load(PluginInfo* info) {
     const bool hooked=PatchVtableSlot(slot,reinterpret_cast<void*>(originalInput),reinterpret_cast<void*>(&HookInput));
     const bool gate=PatchFireGate();
     Log("HOOK flak input slot=%d fire-gate(type4 free fire)=%d",hooked,gate);
+    HookGrenade();
     return hooked;  // never unload code a patched slot points at
 }
 
