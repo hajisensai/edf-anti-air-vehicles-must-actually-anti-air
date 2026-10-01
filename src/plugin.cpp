@@ -1,6 +1,8 @@
 // EDF6AutoTurret: a Vehicle603_Flak whose guns carry a lock-on profile (LockonType != 0)
 // slews its turret onto the guns' current lock target by itself, preferring air targets.
 // The rider keeps the trigger; moving the aim stick takes the turret back for a moment.
+// It also time-fuses the guns' shells to the target's range, and lets LockonType 4 guns fire
+// without a lock (stock fire-start refuses lock-on weapons with an empty lock list).
 // All addresses are RVAs into EDF.dll TimeDateStamp 0x678CCB46; see docs/re-notes.md.
 #include <Windows.h>
 #include <cmath>
@@ -31,9 +33,12 @@ struct Config {
     float pitchOffset=0.0f;
     float pivotHeight=2.5f;    // turret pivot above the vehicle origin, metres
     float airHeight=12.0f;     // a target this far above the pivot counts as air
-    float bulletSpeed=0.0f;    // metres per frame for lead; 0 disables lead
+    bool lead=true;            // aim ahead of moving targets, using the gun's own AmmoSpeed
     float overrideDeadzone=0.2f;
     DWORD overrideMs=800;      // manual stick input suspends auto-aim this long
+    bool fuse=true;            // set each round's lifetime (its burst point) to the target's range
+    float fuseBias=0.0f;       // frames added to the computed fuse
+    int fuseMin=4;             // never burst closer than this many frames
 };
 Config cfg{};
 FILETIME iniStamp{};
@@ -51,6 +56,8 @@ constexpr std::size_t kHolderWeapon=0x10;
 constexpr std::size_t kAimAxes=0x10,kAxisStride=0x40,kAxisMin=0x0,kAxisMax=0x4,kAxisAngle=0x8;
 // Weapon: lock-on profile and std::list<{weak_ptr target, float time}>
 constexpr std::size_t kLockonType=0x6B0,kLockList=0xC60;
+// Weapon ammo parameters, copied into each round when it is fired
+constexpr std::size_t kAmmoSpeed=0x894,kAmmoAlive=0x898;
 constexpr std::size_t kNodeTarget=0x10,kNodeCtrl=0x18;
 // GameObjectBase aim point: a body node list when present, else the origin
 constexpr std::size_t kAimNodes=0x368,kAimNodeCount=0x378,kAimNodePos=0x10;
@@ -78,6 +85,10 @@ struct Diag {
     const char* stop;
 };
 Diag diag{};
+
+// Data AmmoAlive per gun, so the fuse can return to max range when nothing is tracked.
+struct Fuse { const void* weapon; std::int32_t alive; };
+Fuse fuses[16]{};
 
 void Log(const char* format,...) noexcept {
     if(!logPath[0])return;
@@ -140,8 +151,8 @@ void ToLocal(const unsigned char* vehicle,const float* world,float* local) noexc
 }
 
 // Best lock across the seat's guns: any air target beats any ground one, nearest first.
-const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char* seat,bool& armed,float* local) noexcept {
-    armed=false;
+const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char* seat,bool& armed,float* local,float& speed) noexcept {
+    armed=false;speed=0.0f;
     const unsigned char* best=nullptr;float bestScore=0.0f;
     const auto holders=At<const unsigned char* const*>(seat,kSeatWeapons);
     const auto count=At<std::uint64_t>(seat,kSeatWeaponCount);
@@ -150,7 +161,7 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
         if(!Readable(holders[i],kHolderWeapon+8))continue;
         const auto weapon=At<const unsigned char*>(holders[i],kHolderWeapon);
         if(!Readable(weapon,kLockList+0x10) || !At<std::int32_t>(weapon,kLockonType))continue;
-        armed=true;++diag.weapons;
+        armed=true;++diag.weapons;speed=At<float>(weapon,kAmmoSpeed);
         diag.listed+=static_cast<unsigned>(At<std::uint64_t>(weapon,kLockList+8));
         const auto head=At<const unsigned char*>(weapon,kLockList);
         if(!Readable(head,0x10))continue;
@@ -170,19 +181,46 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
     return best;
 }
 
-void Lead(const unsigned char* vehicle,Track& track,const unsigned char* target,float* local) noexcept {
+void Lead(const unsigned char* vehicle,Track& track,const unsigned char* target,float* local,float speed) noexcept {
     float world[3];
     if(!AimPoint(target,world))return;
     const auto now=GetTickCount64();
-    if(track.target==target && cfg.bulletSpeed>0.0f && now-track.at<200) {
+    if(track.target==target && cfg.lead && speed>0.01f && now-track.at<200) {
         // Per-frame target velocity from the last sample; the frame is ~1/60 s.
         const float frames=Clamp((now-track.at)/16.6667f,1.0f,12.0f);
         const float v[3]={(world[0]-track.last[0])/frames,(world[1]-track.last[1])/frames,(world[2]-track.last[2])/frames};
-        const float t=std::sqrt(Dot(local,local))/cfg.bulletSpeed;
+        const float t=std::sqrt(Dot(local,local))/speed;
         const float ahead[3]={world[0]+v[0]*t,world[1]+v[1]*t,world[2]+v[2]*t};
         ToLocal(vehicle,ahead,local);
     }
     track.target=target;std::memcpy(track.last,world,sizeof(world));
+}
+
+std::int32_t BaseAlive(unsigned char* weapon) noexcept {
+    for(auto& f:fuses)if(f.weapon==weapon)return f.alive;
+    for(auto& f:fuses)if(!f.weapon){f={weapon,At<std::int32_t>(weapon,kAmmoAlive)};return f.alive;}
+    fuses[0]={weapon,At<std::int32_t>(weapon,kAmmoAlive)};   // full: recycle (stale vehicles)
+    return fuses[0].alive;
+}
+
+// Time fuse: rounds burst after the flight time to `distance` metres; distance<0 = max range.
+void SetFuses(const unsigned char* seat,float distance) noexcept {
+    const auto holders=At<unsigned char* const*>(seat,kSeatWeapons);
+    const auto count=At<std::uint64_t>(seat,kSeatWeaponCount);
+    if(count>8 || !Readable(holders,count*8))return;
+    for(std::uint64_t i=0;i<count;++i) {
+        if(!Readable(holders[i],kHolderWeapon+8))continue;
+        const auto weapon=At<unsigned char*>(holders[i],kHolderWeapon);
+        if(!Readable(weapon,kLockList+0x10,true) || !At<std::int32_t>(weapon,kLockonType))continue;
+        const std::int32_t base=BaseAlive(weapon);
+        const float speed=At<float>(weapon,kAmmoSpeed);
+        std::int32_t alive=base;
+        if(cfg.fuse && distance>=0.0f && speed>0.01f) {
+            const float frames=std::ceil(distance/speed+cfg.fuseBias);
+            alive=static_cast<std::int32_t>(Clamp(frames,static_cast<float>(cfg.fuseMin),static_cast<float>(base)));
+        }
+        Put<std::int32_t>(weapon,kAmmoAlive,alive);
+    }
 }
 
 void Steer(unsigned char* vehicle) noexcept {
@@ -195,13 +233,17 @@ void Steer(unsigned char* vehicle) noexcept {
     const auto now=GetTickCount64();
     const float stickX=At<float>(seat,kStick),stickY=At<float>(seat,kStick+4);
     if(std::fabs(stickX)>cfg.overrideDeadzone || std::fabs(stickY)>cfg.overrideDeadzone)track.manualUntil=now+cfg.overrideMs;
-    bool armed=false;float local[3]{};
-    const auto target=PickTarget(vehicle,seat,armed,local);
+    bool armed=false;float local[3]{},speed=0.0f;
+    const auto target=PickTarget(vehicle,seat,armed,local,speed);
     if(!armed){diag.stop="unarmed";return;}       // a stock flak: leave it alone
-    if(now<track.manualUntil){diag.stop="manual";track.at=now;track.target=nullptr;return;}
-    if(!target){diag.stop="no-target";track.at=now;track.target=nullptr;return;}
+    if(!target){diag.stop="no-target";SetFuses(seat,-1.0f);track.at=now;track.target=nullptr;return;}
+    if(now<track.manualUntil) {
+        diag.stop="manual";SetFuses(seat,std::sqrt(Dot(local,local)));
+        track.at=now;track.target=nullptr;return;
+    }
     diag.stop="aiming";
-    Lead(vehicle,track,target,local);
+    Lead(vehicle,track,target,local,speed);
+    SetFuses(seat,std::sqrt(Dot(local,local)));
     track.at=now;
     const auto axes=seat+kSeatAim+kAimAxes;
     const float yaw=At<float>(axes,kAxisAngle),pitch=At<float>(axes+kAxisStride,kAxisAngle);
@@ -215,8 +257,8 @@ void Steer(unsigned char* vehicle) noexcept {
     Put<float>(vehicle,kTurn,in[0]);Put<float>(vehicle,kTurn+4,in[1]);
     if(cfg.debug && now-track.loggedAt>500) {
         track.loggedAt=now;
-        Log("AIM v=%p t=%p local=(%.1f,%.1f,%.1f) yaw=%.3f->%.3f pitch=%.3f->%.3f in=(%.2f,%.2f)",
-            vehicle,target,local[0],local[1],local[2],yaw,wantYaw,pitch,wantPitch,in[0],in[1]);
+        Log("AIM fuse=%dm v=%p t=%p local=(%.1f,%.1f,%.1f) yaw=%.3f->%.3f pitch=%.3f->%.3f in=(%.2f,%.2f)",
+            static_cast<int>(std::sqrt(Dot(local,local))),vehicle,target,local[0],local[1],local[2],yaw,wantYaw,pitch,wantPitch,in[0],in[1]);
     }
 }
 
@@ -271,6 +313,25 @@ bool CheckProfile(HMODULE handle) noexcept {
     } __except(EXCEPTION_EXECUTE_HANDLER){image=nullptr;return false;}
 }
 
+// Weapon fire-start (0x690BB0) refuses to fire a lock-on weapon with an empty lock list unless
+// LockonType is 0 or 5. No stock weapon uses type 4 (it auto-locks exactly like type 3), so
+// "cmp eax,5 / je" becomes "cmp eax,4 / jae": type 4 = auto-lock, fire with or without a lock.
+constexpr std::size_t kFireGate=0x690C2E;
+constexpr unsigned char kFireGateStock[]={0x83,0xF8,0x05,0x74,0x23};
+constexpr unsigned char kFireGateFree[]={0x83,0xF8,0x04,0x73,0x23};
+
+bool PatchFireGate() noexcept {
+    unsigned char* at=image+kFireGate;
+    if(Matches(kFireGate,kFireGateFree,sizeof(kFireGateFree)))return true;
+    if(!Matches(kFireGate,kFireGateStock,sizeof(kFireGateStock)))return false;
+    DWORD old=0;
+    if(!VirtualProtect(at,sizeof(kFireGateFree),PAGE_EXECUTE_READWRITE,&old))return false;
+    std::memcpy(at,kFireGateFree,sizeof(kFireGateFree));
+    VirtualProtect(at,sizeof(kFireGateFree),old,&old);
+    FlushInstructionCache(GetCurrentProcess(),at,sizeof(kFireGateFree));
+    return true;
+}
+
 // Swap one vtable entry, only if it still holds the expected function.
 bool PatchVtableSlot(void** slot,void* expected,void* replacement) noexcept {
     DWORD old=0;
@@ -299,13 +360,16 @@ void LoadConfig() noexcept {
     next.pitchOffset=ReadFloat(L"PitchOffset",next.pitchOffset);
     next.pivotHeight=ReadFloat(L"PivotHeight",next.pivotHeight);
     next.airHeight=ReadFloat(L"AirHeight",next.airHeight);
-    next.bulletSpeed=ReadFloat(L"BulletSpeed",next.bulletSpeed);
+    next.lead=GetPrivateProfileIntW(L"AutoTurret",L"Lead",1,iniPath)!=0;
     next.overrideDeadzone=ReadFloat(L"OverrideDeadzone",next.overrideDeadzone);
     next.overrideMs=GetPrivateProfileIntW(L"AutoTurret",L"OverrideMs",next.overrideMs,iniPath);
+    next.fuse=GetPrivateProfileIntW(L"AutoTurret",L"FuseToTarget",1,iniPath)!=0;
+    next.fuseBias=ReadFloat(L"FuseBiasFrames",next.fuseBias);
+    next.fuseMin=GetPrivateProfileIntW(L"AutoTurret",L"FuseMinFrames",next.fuseMin,iniPath);
     cfg=next;
-    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f bullet=%.2f override=%.2f/%lums",
+    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d override=%.2f/%lums fuse=%d%+.1f min=%d",
         cfg.enabled,cfg.debug,cfg.gain,cfg.yawSign,cfg.yawOffset,cfg.pitchSign,cfg.pitchOffset,cfg.pivotHeight,
-        cfg.airHeight,cfg.bulletSpeed,cfg.overrideDeadzone,cfg.overrideMs);
+        cfg.airHeight,cfg.lead,cfg.overrideDeadzone,cfg.overrideMs,cfg.fuse,cfg.fuseBias,cfg.fuseMin);
 }
 
 FILETIME IniStamp() noexcept {
@@ -341,7 +405,8 @@ extern "C" __declspec(dllexport) bool EDFMLAPI EML6_Load(PluginInfo* info) {
     originalInput=reinterpret_cast<InputFn>(image+kFlakInput);
     auto slot=reinterpret_cast<void**>(image+kFlakVtable)+kInputSlot;
     const bool hooked=PatchVtableSlot(slot,reinterpret_cast<void*>(originalInput),reinterpret_cast<void*>(&HookInput));
-    Log("HOOK flak input slot=%d",hooked);
+    const bool gate=PatchFireGate();
+    Log("HOOK flak input slot=%d fire-gate(type4 free fire)=%d",hooked,gate);
     return hooked;  // never unload code a patched slot points at
 }
 

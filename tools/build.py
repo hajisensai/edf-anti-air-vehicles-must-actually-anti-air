@@ -40,14 +40,34 @@ GUN_FIELDS = (
     'AmmoIsPenetration', 'AmmoSize', 'AmmoHitSizeAdjust', 'AmmoHitImpulseAdjust', 'AmmoColor',
     'MuzzleFlash', 'MuzzleFlash_CustomParameter',
 )
-GUN_GRAVITY = 0.5  # Nereid uses 2.0 (it fires downward); anti-air wants a flatter arc
-# The game's own auto lock-on (as on the bike missiles: type 3, no lock time) picks the target;
-# the EDF6AutoTurret plugin then slews the turret onto the gun's current lock.
+GUN_GRAVITY = 0.25  # Nereid uses 2.0 (it fires downward); anti-air wants a flat, fast arc
+# Flak round: GrenadeBullet01 with custom type 1 bursts (blast damage + explosion effect) when its
+# lifetime runs out; with bounce 0 it sticks to whatever it touches and bursts there at the same
+# moment. AmmoAlive is the fuse: the EDF6AutoTurret plugin rewrites it each frame to the flight time
+# to the tracked target, so rounds burst at the target's range; untracked rounds burst at max range.
+# Damage x2 / fire interval x2 against the Nereid gun keeps the same damage per second.
+GUN_AMMO = {
+    'AmmoClass': 'GrenadeBullet01', 'AmmoModel': 'app:/WEAPON/bullet_grenade.rab',
+    'AmmoSpeed': 8.0, 'AmmoAlive': 60.0, 'AmmoSize': 0.6, 'AmmoHitSizeAdjust': 1.0,
+    'AmmoExplosion': 6.0, 'AmmoDamage': 15.0, 'AmmoIsPenetration': 0.0,
+    'AmmoColor': [3.0, 1.6, 0.6, 1.0],
+    # [type 1 = burst on expiry, unused, unused, bounce 0 = stick, trail param, trail frames]
+    'Ammo_CustomParameter': [1.0, -0.004, 1.0, 0.0, 0.05, 8.0],
+    'AmmoHitSe': [0.0, 'common_damages_explode_S', 1.0, 1.0, 1.0, 200.0],
+    'FireInterval': 6.0,
+    'FireSe': [0.0, 'weapon_VHC_striker401_cannonTekkoRapid', 0.8, 1.0, 1.0, 40.0],
+    'resource': ['app:/WEAPON/bullet_grenade.rab'],
+}
+# The game's own auto lock-on picks the target; the EDF6AutoTurret plugin slews the turret onto it.
+# LockonType 4 auto-locks like 3 (bike missiles); the plugin patches the fire gate so type 4 also
+# fires with no lock. DistributionType must stay 0: type 1 frees the list head on an empty-list shot.
+# AutoTimeOut 1 keeps a lock across shots (0 consumes it on every round) until HoldTime runs out.
 GUN_LOCKON = {
-    'LockonType': 3.0, 'LockonTargetType': 0.0, 'Lockon_DistributionType': 0.0,
-    'Lockon_FireEndToClear': 0.0, 'Lockon_AutoTimeOut': 0.0, 'LockonRange': 500.0,
+    'LockonType': 4.0, 'LockonTargetType': 0.0, 'Lockon_DistributionType': 0.0,
+    'Lockon_FireEndToClear': 0.0, 'Lockon_AutoTimeOut': 1.0,
     'LockonAngle': [3.14, 1.57], 'LockonTime': 0.0, 'LockonFailedTime': 0.0, 'LockonHoldTime': 8.0,
 }
+TRACK_RANGE_FRACTION = 0.75  # auto-tracking (lock) range as a share of the gun's range
 CALL_READY_AT_START = True  # ReloadInit 1: callable right at mission start
 
 NAMES = {
@@ -124,15 +144,17 @@ def build_gun(side: str) -> bytes:
     for k in GUN_FIELDS:
         r.set(k, copy.deepcopy(src.get(k)))
     r.set('AmmoGravityFactor', GUN_GRAVITY)
+    for k, v in GUN_AMMO.items():
+        r.set(k, py(v))
     for k, v in GUN_LOCKON.items():
         r.set(k, py(v))
+    r.set('LockonRange', gun_range() * TRACK_RANGE_FRACTION)
     set_names(r, GUN_NAMES[side])
     return dsgo.write(doc)
 
 
 def gun_range() -> float:
-    src = load('WEAPON', SOURCE_GUN).root
-    return float(src.get('AmmoSpeed')) * float(src.get('AmmoAlive'))
+    return GUN_AMMO['AmmoSpeed'] * GUN_AMMO['AmmoAlive']
 
 
 def build_call() -> bytes:
@@ -152,7 +174,7 @@ def build_call() -> bytes:
     guns.items[1].items[0] = f'app:/weapon/{GUN_SGO["R"].lower()}'
     res = r.get('resource')
     res.items = [x for x in res.items if 'flak' not in str(x).lower()]
-    res.items += [spawn.items[2], guns.items[0].items[0], guns.items[1].items[0]]
+    res.items += [spawn.items[2], guns.items[0].items[0], guns.items[1].items[0], *GUN_AMMO['resource']]
     return dsgo.write(doc)
 
 
@@ -189,7 +211,7 @@ def build_text(base_mods: str | None, lang: str, template: int, at: int) -> byte
     rows = doc.root.get('text_table').items
     row = copy.deepcopy(rows[template])
     row.items[0] = NAMES[lang.lower()]
-    dmg = float(load('WEAPON', SOURCE_GUN).root.get('AmmoDamage')) * DAMAGE_MUL
+    dmg = GUN_AMMO['AmmoDamage'] * DAMAGE_MUL
     row.items[1] = describe(lang, dmg, gun_range())
     for stat in row.items[2].items:
         if len(stat.items) == 2 and isinstance(stat.items[1], str) and stat.items[1].isdigit():
