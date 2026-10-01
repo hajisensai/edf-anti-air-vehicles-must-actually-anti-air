@@ -65,7 +65,7 @@ GUN_AMMO = {
 GUN_LOCKON = {
     'LockonType': 4.0, 'LockonTargetType': 0.0, 'Lockon_DistributionType': 0.0,
     'Lockon_FireEndToClear': 0.0, 'Lockon_AutoTimeOut': 1.0,
-    'LockonAngle': [3.14, 1.57], 'LockonTime': 0.0, 'LockonFailedTime': 0.0, 'LockonHoldTime': 8.0,
+    'LockonAngle': [3.14, 1.57], 'LockonTime': 0.0, 'LockonFailedTime': 0.0, 'LockonHoldTime': 30.0,
 }
 TRACK_RANGE_FRACTION = 0.75  # auto-tracking (lock) range as a share of the gun's range
 CALL_READY_AT_START = True  # ReloadInit 1: callable right at mission start

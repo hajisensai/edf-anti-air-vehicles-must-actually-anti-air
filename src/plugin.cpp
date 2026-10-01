@@ -29,7 +29,7 @@ struct Config {
     float gain=3.0f;           // stick input per radian of aim error, clamped to +-1
     float yawSign=1.0f;        // axis angle = sign * geometric angle + offset
     float yawOffset=0.0f;
-    float pitchSign=1.0f;
+    float pitchSign=-1.0f;     // the pitch axis is negative-up (Kepler: -60 deg up .. +5 deg down)
     float pitchOffset=0.0f;
     float pivotHeight=2.5f;    // turret pivot above the vehicle origin, metres
     float airHeight=12.0f;     // a target this far above the pivot counts as air
@@ -54,13 +54,14 @@ constexpr std::size_t kSeatStride=0x340,kSeatWeapons=0xC8,kSeatWeaponCount=0xD8,
 constexpr std::size_t kHolderWeapon=0x10;
 // VehicleWeaponAim: axes at +0x10, stride 0x40; {min, max, angle, velocity, ...}
 constexpr std::size_t kAimAxes=0x10,kAxisStride=0x40,kAxisMin=0x0,kAxisMax=0x4,kAxisAngle=0x8;
-// Weapon: lock-on profile and std::list<{weak_ptr target, float time}>
+// Weapon: lock-on profile and std::list<{shared_ptr<LockInfo>, float out-of-cone frames}>
 constexpr std::size_t kLockonType=0x6B0,kLockList=0xC60;
 // Weapon ammo parameters, copied into each round when it is fired
 constexpr std::size_t kAmmoSpeed=0x894,kAmmoAlive=0x898;
-constexpr std::size_t kNodeTarget=0x10,kNodeCtrl=0x18;
-// GameObjectBase aim point: a body node list when present, else the origin
-constexpr std::size_t kAimNodes=0x368,kAimNodeCount=0x378,kAimNodePos=0x10;
+constexpr std::size_t kNodeInfo=0x10,kNodeCtrl=0x18;
+// LockInfo: +0x08 the target object, +0x10 its aim point (kept current by the game),
+// +0x29 valid (the game itself drops a lock whose byte is 0, 0x694203)
+constexpr std::size_t kInfoAim=0x10,kInfoValid=0x29;
 constexpr int kMaxLocks=64;
 constexpr float kPi=3.14159265f;
 
@@ -81,7 +82,7 @@ Track tracks[8]{};
 struct Diag {
     ULONGLONG at;
     unsigned calls,ridden;
-    unsigned weapons,locked,listed,deadByte,expired;
+    unsigned weapons,locked,listed,invalid,expired;
     const char* stop;
 };
 Diag diag{};
@@ -124,22 +125,15 @@ Track& TrackFor(const void* vehicle) noexcept {
 }
 
 bool Alive(const unsigned char* node) noexcept {
-    const auto target=At<const unsigned char*>(node,kNodeTarget);
+    const auto info=At<const unsigned char*>(node,kNodeInfo);
     const auto ctrl=At<const unsigned char*>(node,kNodeCtrl);
-    if(!target || !Readable(ctrl,0x10) || At<std::int32_t>(ctrl,8)<=0){++diag.expired;return false;}
-    if(!Readable(target,kAimNodeCount+8))return false;
-    if(target[kDead])++diag.deadByte;
-    return !target[kDead];
+    if(!info || !Readable(ctrl,0x10) || At<std::int32_t>(ctrl,8)<=0 || !Readable(info,kInfoValid+1)){++diag.expired;return false;}
+    if(!info[kInfoValid])++diag.invalid;
+    return info[kInfoValid]!=0;
 }
 
-bool AimPoint(const unsigned char* target,float* out) noexcept {
-    const float* p=reinterpret_cast<const float*>(target+kPosition);
-    if(At<std::uint64_t>(target,kAimNodeCount)) {
-        const auto nodes=At<const unsigned char* const*>(target,kAimNodes);
-        if(Readable(nodes,8) && Readable(nodes[0],kAimNodePos+12))
-            p=reinterpret_cast<const float*>(nodes[0]+kAimNodePos);
-    }
-    for(int i=0;i<3;++i){out[i]=p[i];if(!std::isfinite(out[i]))return false;}
+bool AimPoint(const unsigned char* info,float* out) noexcept {
+    for(int i=0;i<3;++i){out[i]=At<float>(info,kInfoAim+i*4);if(!std::isfinite(out[i]))return false;}
     return true;
 }
 
@@ -169,7 +163,7 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
         for(int n=0;n<kMaxLocks && node!=head && Readable(node,0x28);++n,node=At<const unsigned char*>(node,0)) {
             if(!Alive(node))continue;
             ++diag.locked;
-            const auto target=At<const unsigned char*>(node,kNodeTarget);
+            const auto target=At<const unsigned char*>(node,kNodeInfo);
             float world[3],l[3];
             if(!AimPoint(target,world))continue;
             ToLocal(vehicle,world,l);
@@ -247,6 +241,7 @@ void Steer(unsigned char* vehicle) noexcept {
     track.at=now;
     const auto axes=seat+kSeatAim+kAimAxes;
     const float yaw=At<float>(axes,kAxisAngle),pitch=At<float>(axes+kAxisStride,kAxisAngle);
+    if(!std::isfinite(yaw) || !std::isfinite(pitch)){diag.stop="bad-axis";return;}
     const float wantYaw=cfg.yawSign*std::atan2(local[0],local[2])+cfg.yawOffset;
     const float flat=std::sqrt(local[0]*local[0]+local[2]*local[2]);
     float wantPitch=cfg.pitchSign*std::atan2(local[1],flat)+cfg.pitchOffset;
@@ -254,6 +249,7 @@ void Steer(unsigned char* vehicle) noexcept {
     const bool fullCircle=At<float>(axes,kAxisMax)-At<float>(axes,kAxisMin)>=2*kPi-0.01f;
     const float yawError=fullCircle ? Wrap(wantYaw-yaw) : wantYaw-yaw;
     const float in[2]={Clamp(yawError*cfg.gain,-1.0f,1.0f),Clamp((wantPitch-pitch)*cfg.gain,-1.0f,1.0f)};
+    if(!std::isfinite(in[0]) || !std::isfinite(in[1])){diag.stop="bad-input";return;}
     Put<float>(vehicle,kTurn,in[0]);Put<float>(vehicle,kTurn+4,in[1]);
     if(cfg.debug && now-track.loggedAt>500) {
         track.loggedAt=now;
@@ -267,8 +263,8 @@ void ReloadConfigIfChanged() noexcept;
 void FlushDiag(const void* vehicle) noexcept {
     const auto now=GetTickCount64();
     if(!cfg.debug || now-diag.at<1000)return;
-    if(diag.at)Log("DIAG v=%p calls=%u ridden=%u weapons=%u listed=%u locked=%u dead=%u expired=%u last=%s",
-        vehicle,diag.calls,diag.ridden,diag.weapons,diag.listed,diag.locked,diag.deadByte,diag.expired,
+    if(diag.at)Log("DIAG v=%p calls=%u ridden=%u weapons=%u listed=%u locked=%u invalid=%u expired=%u last=%s",
+        vehicle,diag.calls,diag.ridden,diag.weapons,diag.listed,diag.locked,diag.invalid,diag.expired,
         diag.stop?diag.stop:"-");
     diag=Diag{};diag.at=now;
 }
