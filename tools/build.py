@@ -26,7 +26,7 @@ TEMPLATE_CALL = 'AWEAPON349.SGO'   # KG6 Kepler E (Ranger vehicle call)
 TEMPLATE_ROW = 'aWeapon349'
 SOURCE_GUN = 'V_409HELI_GATLING01.SGO'   # EF31 Nereid auto-capture cannon
 LANGS = ('JA', 'EN', 'CN', 'KR', 'SC')
-ACQUIRE = 3.0           # WEAPONTABLE column 5: 3 = download-unlock gift (1 never reaches existing saves)
+ACQUIRE = 0.0           # WEAPONTABLE column 5: 0 = ordinary weapon. non-zero appears to mark DLC content whose owned bit is dropped on reload (inferred, see re-notes); unlocking is a save write, not a table value
 DURABILITY_MUL = 6.0    # Kepler F tier
 DAMAGE_MUL = 6.0
 TURRET = [65.0, 0.3, 0.3]  # gun-L turret params (DLC Kepler values: faster traverse)

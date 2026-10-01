@@ -70,6 +70,15 @@ struct Track {
 };
 Track tracks[8]{};
 
+// Once-a-second snapshot of where Steer stopped, for Debug=1.
+struct Diag {
+    ULONGLONG at;
+    unsigned calls,ridden;
+    unsigned weapons,locked,listed,deadByte,expired;
+    const char* stop;
+};
+Diag diag{};
+
 void Log(const char* format,...) noexcept {
     if(!logPath[0])return;
     char text[1000]{};va_list args;va_start(args,format);vsnprintf_s(text,sizeof(text),_TRUNCATE,format,args);va_end(args);
@@ -106,8 +115,10 @@ Track& TrackFor(const void* vehicle) noexcept {
 bool Alive(const unsigned char* node) noexcept {
     const auto target=At<const unsigned char*>(node,kNodeTarget);
     const auto ctrl=At<const unsigned char*>(node,kNodeCtrl);
-    if(!target || !Readable(ctrl,0x10) || At<std::int32_t>(ctrl,8)<=0)return false;
-    return Readable(target,kAimNodeCount+8) && !target[kDead];
+    if(!target || !Readable(ctrl,0x10) || At<std::int32_t>(ctrl,8)<=0){++diag.expired;return false;}
+    if(!Readable(target,kAimNodeCount+8))return false;
+    if(target[kDead])++diag.deadByte;
+    return !target[kDead];
 }
 
 bool AimPoint(const unsigned char* target,float* out) noexcept {
@@ -139,12 +150,14 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
         if(!Readable(holders[i],kHolderWeapon+8))continue;
         const auto weapon=At<const unsigned char*>(holders[i],kHolderWeapon);
         if(!Readable(weapon,kLockList+0x10) || !At<std::int32_t>(weapon,kLockonType))continue;
-        armed=true;
+        armed=true;++diag.weapons;
+        diag.listed+=static_cast<unsigned>(At<std::uint64_t>(weapon,kLockList+8));
         const auto head=At<const unsigned char*>(weapon,kLockList);
         if(!Readable(head,0x10))continue;
         const unsigned char* node=At<const unsigned char*>(head,0);
         for(int n=0;n<kMaxLocks && node!=head && Readable(node,0x28);++n,node=At<const unsigned char*>(node,0)) {
             if(!Alive(node))continue;
+            ++diag.locked;
             const auto target=At<const unsigned char*>(node,kNodeTarget);
             float world[3],l[3];
             if(!AimPoint(target,world))continue;
@@ -173,8 +186,10 @@ void Lead(const unsigned char* vehicle,Track& track,const unsigned char* target,
 }
 
 void Steer(unsigned char* vehicle) noexcept {
+    diag.stop="vehicle";
     if(!Readable(vehicle,kTurn+0x10,true) || vehicle[kDead] || At<std::uint32_t>(vehicle,kSeatCount)==0)return;
     const auto seat=At<const unsigned char*>(vehicle,kSeats);
+    diag.stop="seat";
     if(!Readable(seat,kSeatStride))return;
     Track& track=TrackFor(vehicle);
     const auto now=GetTickCount64();
@@ -182,8 +197,10 @@ void Steer(unsigned char* vehicle) noexcept {
     if(std::fabs(stickX)>cfg.overrideDeadzone || std::fabs(stickY)>cfg.overrideDeadzone)track.manualUntil=now+cfg.overrideMs;
     bool armed=false;float local[3]{};
     const auto target=PickTarget(vehicle,seat,armed,local);
-    if(!armed)return;                       // a stock flak: leave it alone
-    if(!target || now<track.manualUntil){track.at=now;track.target=nullptr;return;}
+    if(!armed){diag.stop="unarmed";return;}       // a stock flak: leave it alone
+    if(now<track.manualUntil){diag.stop="manual";track.at=now;track.target=nullptr;return;}
+    if(!target){diag.stop="no-target";track.at=now;track.target=nullptr;return;}
+    diag.stop="aiming";
     Lead(vehicle,track,target,local);
     track.at=now;
     const auto axes=seat+kSeatAim+kAimAxes;
@@ -205,13 +222,25 @@ void Steer(unsigned char* vehicle) noexcept {
 
 void ReloadConfigIfChanged() noexcept;
 
+void FlushDiag(const void* vehicle) noexcept {
+    const auto now=GetTickCount64();
+    if(!cfg.debug || now-diag.at<1000)return;
+    if(diag.at)Log("DIAG v=%p calls=%u ridden=%u weapons=%u listed=%u locked=%u dead=%u expired=%u last=%s",
+        vehicle,diag.calls,diag.ridden,diag.weapons,diag.listed,diag.locked,diag.deadByte,diag.expired,
+        diag.stop?diag.stop:"-");
+    diag=Diag{};diag.at=now;
+}
+
 void __fastcall HookInput(void* vehicle,std::uintptr_t hasInput) {
     originalInput(vehicle,hasInput);
+    ++diag.calls;
+    FlushDiag(vehicle);
     if(!(hasInput&0xFF))return;             // no rider: the stock code just zeroed the turn
+    ++diag.ridden;
     ReloadConfigIfChanged();
     if(!cfg.enabled)return;
     __try { Steer(static_cast<unsigned char*>(vehicle)); }
-    __except(EXCEPTION_EXECUTE_HANDLER) {}
+    __except(EXCEPTION_EXECUTE_HANDLER) {diag.stop="fault";}
 }
 
 bool Matches(std::size_t rva,const unsigned char* bytes,std::size_t size) noexcept {
