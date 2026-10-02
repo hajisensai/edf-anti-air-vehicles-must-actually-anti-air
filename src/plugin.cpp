@@ -39,6 +39,7 @@ struct Config {
     bool lead=true;            // aim ahead of moving targets, using the gun's own AmmoSpeed
     float trackRange=0.75f;    // auto-aim only at targets within this share of the gun's range
     bool feedForward=true;     // drive the turret at the aim point's own angular rate, not only on the error
+    float slewWeight=250.0f;   // metres a new target may be farther per radian it saves the turret turning
     bool fuse=true;            // set each round's lifetime (its burst point) to the target's range
     float fuseBias=0.0f;       // frames added to the computed fuse
     int fuseMin=4;             // never burst closer than this many frames
@@ -363,9 +364,17 @@ void* __fastcall DtorHook(void* bullet,unsigned flags) {
 
 std::int32_t BaseAlive(unsigned char* weapon) noexcept;
 
-// Enemy within tracking range: the one already being tracked while it stays there, otherwise
-// any air target beats any ground one, nearest first. Returns the enemy object; `world` is its
-// aim point, always taken from the object's first lock point so the lead sees a steady track.
+// Wanted turret yaw/pitch for a point in the vehicle frame.
+void AimAngles(const float* local,float& yaw,float& pitch) noexcept {
+    yaw=cfg.yawSign*std::atan2(local[0],local[2])+cfg.yawOffset;
+    pitch=cfg.pitchSign*std::atan2(local[1],std::sqrt(local[0]*local[0]+local[2]*local[2]))+cfg.pitchOffset;
+}
+
+// The tracked enemy stays the target while it lives within the gun's full range (dropping it at the
+// tracking-range edge made the turret flip between targets every second or two). A new one comes
+// from within tracking range: any air target beats any ground one, then distance plus the turn it
+// costs from where the guns point now. Returns the enemy object; `world` is its aim point, always
+// taken from the object's first lock point so the lead sees a steady track.
 const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,const void* keep,bool& armed,float* world,float& speed) noexcept {
     armed=false;speed=0.0f;
     float range=0.0f;
@@ -384,13 +393,20 @@ const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,co
     if(!armed)return nullptr;
     ScanEnemies(vehicle,range);
     const float track=cfg.trackRange*range;
+    const auto axes=seat+kSeatAim+kAimAxes;
+    const float yaw=At<float>(axes,kAxisAngle),pitch=At<float>(axes+kAxisStride,kAxisAngle);
+    const bool aimed=std::isfinite(yaw) && std::isfinite(pitch);
     const void* best=nullptr;float bestScore=0.0f;
     for(int i=0;i<enemyCount;++i) {
+        if(enemies[i].object==keep){best=keep;break;}    // the scan already limits it to full range
+    }
+    for(int i=0;i<enemyCount && best!=keep;++i) {
         float l[3];ToLocal(vehicle,enemies[i].pos,l);
         const float distance=std::sqrt(Dot(l,l));
         if(distance>track)continue;
-        if(enemies[i].object==keep){best=keep;break;}
-        const float score=distance+(l[1]>cfg.airHeight ? 0.0f : 1.0e6f);
+        float wantYaw,wantPitch;AimAngles(l,wantYaw,wantPitch);
+        const float turn=aimed ? std::fabs(Wrap(wantYaw-yaw))+std::fabs(wantPitch-pitch) : 0.0f;
+        const float score=distance+turn*cfg.slewWeight+(l[1]>cfg.airHeight ? 0.0f : 1.0e6f);
         if(!best || score<bestScore){best=enemies[i].object;bestScore=score;}
     }
     if(!best)return nullptr;
@@ -489,9 +505,7 @@ void Steer(unsigned char* vehicle) noexcept {
     const auto axes=seat+kSeatAim+kAimAxes;
     const float yaw=At<float>(axes,kAxisAngle),pitch=At<float>(axes+kAxisStride,kAxisAngle);
     if(!std::isfinite(yaw) || !std::isfinite(pitch)){diag.stop="bad-axis";return;}
-    const float wantYaw=cfg.yawSign*std::atan2(local[0],local[2])+cfg.yawOffset;
-    const float flat=std::sqrt(local[0]*local[0]+local[2]*local[2]);
-    float wantPitch=cfg.pitchSign*std::atan2(local[1],flat)+cfg.pitchOffset;
+    float wantYaw,wantPitch;AimAngles(local,wantYaw,wantPitch);
     wantPitch=Clamp(wantPitch,At<float>(axes+kAxisStride,kAxisMin),At<float>(axes+kAxisStride,kAxisMax));
     const bool fullCircle=At<float>(axes,kAxisMax)-At<float>(axes,kAxisMin)>=2*kPi-0.01f;
     const float yawError=fullCircle ? Wrap(wantYaw-yaw) : wantYaw-yaw;
@@ -623,6 +637,7 @@ void LoadConfig() noexcept {
     next.lead=GetPrivateProfileIntW(L"AutoTurret",L"Lead",1,iniPath)!=0;
     next.trackRange=Clamp(ReadFloat(L"TrackRange",next.trackRange),0.0f,1.0f);
     next.feedForward=GetPrivateProfileIntW(L"AutoTurret",L"FeedForward",1,iniPath)!=0;
+    next.slewWeight=Clamp(ReadFloat(L"SlewWeight",next.slewWeight),0.0f,5000.0f);
     next.fuse=GetPrivateProfileIntW(L"AutoTurret",L"FuseToTarget",1,iniPath)!=0;
     next.fuseBias=ReadFloat(L"FuseBiasFrames",next.fuseBias);
     next.fuseMin=GetPrivateProfileIntW(L"AutoTurret",L"FuseMinFrames",next.fuseMin,iniPath);
@@ -630,9 +645,9 @@ void LoadConfig() noexcept {
     next.contact=GetPrivateProfileIntW(L"AutoTurret",L"ContactFuse",1,iniPath)!=0;
     next.burstVisual=Clamp(ReadFloat(L"BurstVisualScale",next.burstVisual),0.2f,10.0f);
     cfg=next;
-    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d track=%.2f ff=%d fuse=%d%+.1f min=%d proximity=%.1f contact=%d",
+    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d track=%.2f ff=%d slew=%.0f fuse=%d%+.1f min=%d proximity=%.1f contact=%d",
         cfg.enabled,cfg.debug,cfg.gain,cfg.yawSign,cfg.yawOffset,cfg.pitchSign,cfg.pitchOffset,cfg.pivotHeight,
-        cfg.airHeight,cfg.lead,cfg.trackRange,cfg.feedForward,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact);
+        cfg.airHeight,cfg.lead,cfg.trackRange,cfg.feedForward,cfg.slewWeight,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact);
 }
 
 FILETIME IniStamp() noexcept {
