@@ -1,12 +1,12 @@
 """Turn the stock KG6 Kepler anti-air vehicles into flak vehicles and the DLC KG7 Bohr into a
 self-aiming ground-attack launcher, into dist/Mods.
 
-  python tools/build.py [--out dist/Mods]
+  python tools/build.py [--out dist/Mods] [--no-text]
 
-Overrides only the Kepler / Bohr call SGOs and their gun pairs; no WEAPONTABLE /
-WEAPONTEXT rows are added, so it coexists with mods that edit the tables. The guns get flak rounds
-and the LockonType 4 marker the EDF6AutoTurret plugin aims; the calls get more durability and a
-faster turret.
+Overrides the Kepler / Bohr call SGOs and their gun pairs. The guns get flak rounds and the
+LockonType 4 marker the EDF6AutoTurret plugin aims; the calls get more durability and a faster
+turret. No weapon rows are added. The vehicles' own WEAPONTEXT rows are rewritten to show the new
+numbers, on top of the tables already in --out, so other mods' rows are kept (see describe.py).
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 import dsgo  # noqa: E402
+import describe  # noqa: E402
 import gamefs  # noqa: E402
 from dsgo import Node  # noqa: E402
 
@@ -40,6 +41,7 @@ FIRE_SLOWDOWN = 2.0
 
 # The DLC Kepler YF-HV keeps its high-velocity solid shot, durability and fast turret (already the
 # buffed Kepler); its guns only get the auto-aim marker.
+HV_CALL = 'MPACK_A_WEAPON016.SGO'   # not rebuilt; only its description changes
 HV_GUN = 'V603_FLAK_GUNH01_DLC_{side}.SGO'
 
 # The KG7 Bohr (DLC 2) and Bohr B share one grenade-launcher pair. They keep their own rounds,
@@ -157,7 +159,9 @@ def build_call(name: str, turret: list[float] | None, resources: list[str]) -> b
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default=os.path.join(os.path.dirname(__file__), '..', 'dist', 'Mods'))
-    out = os.path.abspath(ap.parse_args().out)
+    ap.add_argument('--no-text', action='store_true', help='leave the WEAPONTEXT tables alone')
+    args = ap.parse_args()
+    out = os.path.abspath(args.out)
     files: dict[str, bytes] = {}
     for name in CALLS:
         files[f'WEAPON/{name}'] = build_call(name, TURRET, GUN_AMMO['resource'])
@@ -170,6 +174,11 @@ def main() -> None:
         files[f'WEAPON/{name}'] = build_call(name, None, [])   # its turret is already the fast DLC one
     for side in SIDES:
         files[f'WEAPON/{BOHR_GUN.format(side=side)}'] = build_bohr_gun(side)
+    if not args.no_text:
+        vehicles = [describe.Vehicle(c, f'V603_FLAK_GUN{t}_L.SGO', 'flak') for c, t in CALLS.items()]
+        vehicles.append(describe.Vehicle(HV_CALL, HV_GUN.format(side='L'), 'air'))
+        vehicles += [describe.Vehicle(c, BOHR_GUN.format(side='L'), 'ground') for c in BOHR_CALLS]
+        files.update(describe.build_texts(vehicles, files, out))
     for rel, data in files.items():
         dsgo.parse(data)
         path = os.path.join(out, rel)

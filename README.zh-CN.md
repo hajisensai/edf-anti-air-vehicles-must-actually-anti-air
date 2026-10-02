@@ -10,7 +10,7 @@
 - **EDF6AutoTurret.dll**：[EDFModLoader](https://github.com/BlueAmulet/EDFModLoader) 插件。炮塔自己瞄准：
   直接从游戏的敌人列表里选目标，计算提前量，按炮弹的抛物线解算仰角，并用前馈控制炮塔，炮弹不再拖在横穿目标的身后。
   高射炮弹带定时引信（目标距离处空爆）、近炸引信和触发引信。按住瞄准摇杆可以手动瞄准，松开后炮塔立即接管。
-- **武器数据**：直接覆盖原版载具自己的文件。不新增武器行，也从不写 `WEAPONTABLE` / `WEAPONTEXT`，可以和改表的 mod 共存。
+- **武器数据**：直接覆盖原版载具自己的文件，不新增武器行。`WEAPONTEXT` 里这几辆载具的说明会改成新数值；只改它们自己的行，并叠加在 `Mods` 里已有的表上，改表的 mod 的内容会保留。
 
 ## 改了什么
 
@@ -21,8 +21,6 @@
 | KG7 玻尔斯、玻尔斯 B（DLC） | 对地模式自瞄：优先打地面目标，按抛物线瞄准，保持原版触地爆炸。耐久 ×2，爆炸半径 4m → 6m。 |
 
 原因：原版克卜勒的 DPS 只有同级坦克、直升机的 1/3～1/2，耐久不到一半，射程还是同期最短。玻尔斯的 DPS 已经高于同级的霸里亚斯 TZ4，但耐久远不到对方的一半。
-
-游戏里的武器说明仍显示原版数值。
 
 ## 安装
 
@@ -36,9 +34,9 @@
    python tools\build.py --out "%EDF6_DIR%\Mods"
    ```
 
-   它只在 `Mods\WEAPON\` 下写这几辆载具自己的 call 和炮文件；只读取游戏的 `Root.cpk`，不修改它。请在游戏关闭时运行。
+   它在 `Mods\WEAPON\` 下写这几辆载具自己的 call 和炮文件，以及 `WEAPONTEXT.*.SGO` 里它们的 8 行说明；只读取游戏的 `Root.cpk`，不修改它。请在游戏关闭时运行；装了别的会整份替换 `WEAPONTEXT` 的 mod 之后要再运行一次。`--no-text` 不动文本表。
 
-卸载时删掉这些文件和插件即可。设置在 `EDF6AutoTurret.ini`，游戏运行中保存即生效；`Debug=1` 会把炮塔的行为写进 `EDF6AutoTurret.log`。
+卸载时删掉这些文件和插件即可（`WEAPONTEXT` 只有在没有别的 mod 装过时才删，否则重装那个 mod 的）。设置在 `EDF6AutoTurret.ini`，游戏运行中保存即生效；`Debug=1` 会把炮塔的行为写进 `EDF6AutoTurret.log`。
 
 ## 构建插件
 
@@ -52,7 +50,9 @@ DLL 输出到 `dist\Mods\Plugins\`。每次 push 都会由 CI 构建。
 
 ## 兼容性
 
-针对 TimeDateStamp 为 `0x678CCB46` 的 EDF.dll。插件会校验要打补丁的代码，游戏更新后对不上就自动停用。逆向笔记见 [docs/re-notes.md](docs/re-notes.md)。
+针对 TimeDateStamp 为 `0x678CCB46` 的 EDF.dll。插件会校验要打补丁的代码，游戏更新后对不上就自动停用。
+
+联机未经测试。这个 mod 不新增武器行，没装的玩家不会遇到自己没有的行；但每台机器都按自己的文件模拟载具，混装房间里克卜勒在各人眼里的表现不会一致。建议所有玩家都装。逆向笔记见 [docs/re-notes.md](docs/re-notes.md)。
 
 ## 许可
 

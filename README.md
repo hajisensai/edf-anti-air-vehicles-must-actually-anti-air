@@ -13,8 +13,9 @@ It has two parts:
   round's ballistic arc and drives the turret with feed-forward so rounds stop trailing crossing
   targets. Flak rounds get a time fuse at the target's range, a proximity fuse and a contact fuse.
   Hold the aim stick to aim by hand; let go and the turret takes over again.
-- **Weapon data** overriding the stock vehicles' own files. No weapon rows are added, and
-  `WEAPONTABLE` / `WEAPONTEXT` are never written, so it coexists with mods that edit the tables.
+- **Weapon data** overriding the stock vehicles' own files. No weapon rows are added. The
+  vehicles' descriptions in `WEAPONTEXT` are rewritten with the new numbers; only their own rows
+  change, on top of whatever tables are already in `Mods`, so mods that edit the tables keep theirs.
 
 ## What changes
 
@@ -27,8 +28,6 @@ It has two parts:
 Why: the stock Keplers deal a third to a half of the damage per second of same-level tanks and
 helicopters, with under half their durability, and the shortest range of any of them. The Bohr
 already out-damages the same-level Barrias TZ4 but has well under half its durability.
-
-The in-game weapon descriptions still show the stock numbers.
 
 ## Install
 
@@ -44,10 +43,13 @@ Requires EDF6 (Steam) with [EDFModLoader](https://github.com/BlueAmulet/EDFModLo
    python tools\build.py --out "%EDF6_DIR%\Mods"
    ```
 
-   It writes only the vehicles' own call and gun files under `Mods\WEAPON\`; it reads the game's
-   `Root.cpk` and never modifies it. Run it while the game is closed.
+   It writes the vehicles' own call and gun files under `Mods\WEAPON\` and their eight rows of
+   the `WEAPONTEXT.*.SGO` tables there; it reads the game's `Root.cpk` and never modifies it. Run it
+   while the game is closed, and again after installing another mod that replaces `WEAPONTEXT`.
+   `--no-text` leaves the text tables alone.
 
-To uninstall, delete those files and the plugin. Settings are in `EDF6AutoTurret.ini` and apply
+To uninstall, delete those files and the plugin (delete the `WEAPONTEXT` files only if no other
+mod installed them; otherwise reinstall that mod's). Settings are in `EDF6AutoTurret.ini` and apply
 while the game runs; `Debug=1` writes what the turret is doing to `EDF6AutoTurret.log`.
 
 ## Build the plugin
@@ -63,7 +65,11 @@ The DLL lands in `dist\Mods\Plugins\`. CI builds it on every push.
 ## Compatibility
 
 Built against EDF.dll with TimeDateStamp `0x678CCB46`. The plugin checks the code it patches and
-turns itself off if the game has changed. Reverse-engineering notes: [docs/re-notes.md](docs/re-notes.md).
+turns itself off if the game has changed.
+
+Online play is untested. The mod adds no weapon rows, so players without it never meet a row they
+do not have; but each machine simulates the vehicles from its own files, so in a mixed lobby the
+Keplers will not behave the same for everyone. Have every player install it. Reverse-engineering notes: [docs/re-notes.md](docs/re-notes.md).
 
 ## License
 
