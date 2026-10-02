@@ -289,12 +289,19 @@ bool Tagged(const void* bullet) noexcept {
     return found;
 }
 
+// One of our anti-air guns firing GrenadeBullet01, the only round the fuses can burst early. The
+// Bohr fires the same class (so its blast hits buildings) but keeps its stock impact fuse.
+bool FlakRounds(const unsigned char* weapon) noexcept {
+    if(At<std::int32_t>(weapon,kLockonType)!=kOurLockonType || At<std::int32_t>(weapon,kLockonTargetType)==kGroundTargetType)return false;
+    const auto factory=At<const unsigned char*>(weapon,kAmmoFactory);
+    return Readable(factory,8) && At<const unsigned char*>(factory,0)==image+kGrenadeFactoryVtable;
+}
+
 void __fastcall SpawnHook(void* weapon,void* bullet) {
     const void* vtable=*static_cast<void**>(weapon);
     for(auto& p:spawnPatches)if(p.vtable==vtable){if(p.original)p.original(weapon,bullet);break;}
     __try {
-        // Only our guns: LockonType 4 is unused by stock weapons (see PatchFireGate).
-        if(bullet && At<std::int32_t>(weapon,kLockonType)==4 && *static_cast<void**>(bullet)==image+kGrenadeVtable)
+        if(bullet && FlakRounds(static_cast<const unsigned char*>(weapon)) && *static_cast<void**>(bullet)==image+kGrenadeVtable)
             Tag(bullet);
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -539,12 +546,6 @@ float AxisInput(Track& track,int a,float want,float angle,float error,bool wrap)
     return in;
 }
 
-// The gun fires GrenadeBullet01 rounds, the only kind the fuses can burst early.
-bool FlakRounds(const unsigned char* weapon) noexcept {
-    const auto factory=At<const unsigned char*>(weapon,kAmmoFactory);
-    return Readable(factory,8) && At<const unsigned char*>(factory,0)==image+kGrenadeFactoryVtable;
-}
-
 std::int32_t BaseAlive(unsigned char* weapon) noexcept {
     for(auto& f:fuses)if(f.weapon==weapon)return f.alive;
     Fuse* slot=&fuses[0];   // full: recycle (stale vehicles)
@@ -569,8 +570,7 @@ void SetFuses(const unsigned char* seat,float frames) noexcept {
     for(std::uint64_t i=0;i<count;++i) {
         if(!Readable(holders[i],kHolderWeapon+8))continue;
         const auto weapon=At<unsigned char*>(holders[i],kHolderWeapon);
-        if(!Readable(weapon,kAmmoAlive+4,true) || At<std::int32_t>(weapon,kLockonType)!=kOurLockonType)continue;
-        if(!FlakRounds(weapon))continue;
+        if(!Readable(weapon,kAmmoAlive+4,true) || !FlakRounds(weapon))continue;
         const std::int32_t base=BaseAlive(weapon);
         std::int32_t alive=base;
         if(cfg.fuse && frames>=0.0f) {

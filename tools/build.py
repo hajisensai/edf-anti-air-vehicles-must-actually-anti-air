@@ -47,10 +47,12 @@ HV_GUN = 'V603_FLAK_GUNH01_DLC_{side}.SGO'
 # The KG7 Bohr (DLC 2) and Bohr B share one grenade-launcher pair. They keep their own rounds,
 # damage and rate (already above the same-level Barrias TZ4); they get the auto-aim in ground mode
 # (LockonTargetType 1: ground targets first, lobbed rounds, stock impact fuse), double durability
-# (24500 / 29400 vs TZ4-R 60000) and a wider blast for crowds.
+# (24500 / 29400 vs TZ4-R 60000), a wider blast for crowds, and the stock grenade launcher's round
+# class, whose blast also wrecks buildings (the DLC gun's _MapNoDamage variant spares them).
 BOHR_CALLS = ('MPACK_B_WEAPON025.SGO', 'MPACK_B_WEAPON028.SGO')
 BOHR_GUN = 'V603_FLAK_GLGUN01_DLC_{side}.SGO'
 BOHR_EXPLOSION = 6.0   # stock 4
+BOHR_AMMO_CLASS = 'GrenadeBullet01'   # stock GrenadeBullet01_MapNoDamage; same params as AGRENADELAUNCHER01
 GROUND_TARGET_TYPE = 1.0
 
 # Ballistics, fire rate, tracer colour, sound and muzzle flash come from the Nereid gun;
@@ -140,6 +142,7 @@ def build_bohr_gun(side: str) -> bytes:
     r.set('LockonTargetType', GROUND_TARGET_TYPE)
     r.set('LockonRange', 0.0)
     r.set('AmmoExplosion', BOHR_EXPLOSION)
+    r.set('AmmoClass', BOHR_AMMO_CLASS)
     return dsgo.write(doc)
 
 

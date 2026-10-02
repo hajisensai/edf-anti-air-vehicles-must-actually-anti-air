@@ -23,7 +23,7 @@ It has two parts:
 |---|---|
 | KG6 Kepler, E, F, YE, YF | Flak: exploding rounds (8 m blast), proximity / time / contact fuses, 480 m range. Half the fire rate at twice the damage per round (same damage per second on paper, half the bursts on screen). Durability x2. DLC YF-HV turret speed. Air targets first. |
 | KG6 Kepler YF-HV (DLC) | Auto-aim only; keeps its high-velocity solid shot, durability and turret. |
-| KG7 Bohr, Bohr B (DLC) | Auto-aim in ground mode: ground targets first, lobbed rounds aimed on their arc, stock impact fuse. Durability x2, blast 4 m -> 6 m. |
+| KG7 Bohr, Bohr B (DLC) | Auto-aim in ground mode: ground targets first, lobbed rounds aimed on their arc, stock impact fuse. Durability x2, blast 4 m -> 6 m, and the blasts now wreck buildings. |
 
 Why: the stock Keplers deal a third to a half of the damage per second of same-level tanks and
 helicopters, with under half their durability, and the shortest range of any of them. The Bohr

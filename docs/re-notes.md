@@ -65,7 +65,7 @@ The plugin does the same and takes the lower arc.
 | What | Where |
 |---|---|
 | vtable | `0x17A17E0`; slot 1 deleting dtor `0x265B10`, slot 5 update `0x264AB0` (both hooked) |
-| factory vtable | `0x17A1688` (`GrenadeBullet01_MapNoDamage`, the Bohr's round, is a separate class: `0x17A16E8`, factory `0x17A16C8`) |
+| factory vtable | `0x17A1688` (`GrenadeBullet01_MapNoDamage`, the stock Bohr's round that spares buildings, is a separate class: `0x17A16E8`, factory `0x17A16C8`; the mod switches the Bohr to `GrenadeBullet01` and tells it apart from flak by LockonTargetType 1) |
 | weak-this control block | `+0x30` |
 | flight control block C | `+0x140` |
 | C: flags / age / lifetime | `+0xAF4` / `+0xAF8` / `+0xA08`; expires when age >= lifetime (`0x236899`) |

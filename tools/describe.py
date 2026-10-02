@@ -38,11 +38,11 @@ NOTES = {
         'SC': '【防空MOD】炮塔会自动瞄准，优先攻击空中目标；推动瞄准摇杆时可手动瞄准。',
     },
     'ground': {
-        'JA': '【防空MOD】砲塔は自動で照準し、地上の敵を優先する。弾道を計算して曲射で狙う。照準スティックを倒している間は手動で照準できる。',
-        'EN': '[Anti-Air mod] The turret aims itself, ground targets first, lobbing rounds on their arc; hold the aim stick to aim by hand.',
-        'CN': '【防空MOD】砲塔會自動瞄準，優先攻擊地面目標，並依彈道拋射瞄準；推動瞄準搖桿時可手動瞄準。',
-        'KR': '[대공 MOD] 포탑이 자동으로 조준하며 지상의 적을 우선한다. 탄도를 계산해 곡사로 조준한다. 조준 스틱을 기울이는 동안에는 수동으로 조준할 수 있다.',
-        'SC': '【防空MOD】炮塔会自动瞄准，优先攻击地面目标，并按弹道抛射瞄准；推动瞄准摇杆时可手动瞄准。',
+        'JA': '【防空MOD】砲塔は自動で照準し、地上の敵を優先する。弾道を計算して曲射で狙う。炸薬弾の爆発で建物も破壊できる。照準スティックを倒している間は手動で照準できる。',
+        'EN': '[Anti-Air mod] The turret aims itself, ground targets first, lobbing rounds on their arc. The blasts also wreck buildings. Hold the aim stick to aim by hand.',
+        'CN': '【防空MOD】砲塔會自動瞄準，優先攻擊地面目標，並依彈道拋射瞄準。炸藥的爆炸也能摧毀建築物。推動瞄準搖桿時可手動瞄準。',
+        'KR': '[대공 MOD] 포탑이 자동으로 조준하며 지상의 적을 우선한다. 탄도를 계산해 곡사로 조준한다. 작약탄의 폭발로 건물도 파괴할 수 있다. 조준 스틱을 기울이는 동안에는 수동으로 조준할 수 있다.',
+        'SC': '【防空MOD】炮塔会自动瞄准，优先攻击地面目标，并按弹道抛射瞄准。炸药的爆炸也能摧毁建筑物。推动瞄准摇杆时可手动瞄准。',
     },
 }
 
