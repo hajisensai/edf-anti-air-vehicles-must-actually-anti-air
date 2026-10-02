@@ -40,6 +40,8 @@ struct Config {
     float trackRange=0.75f;    // auto-aim only at targets within this share of the gun's range
     bool feedForward=true;     // drive the turret at the aim point's own angular rate, not only on the error
     float slewWeight=250.0f;   // metres a new target may be farther per radian it saves the turret turning
+    float dragDeadzone=0.3f;   // aim stick past this aims by hand while held (0 = never)
+    DWORD dragDropMs=3000;     // the target dragged away from is not picked again for this long
     bool fuse=true;            // set each round's lifetime (its burst point) to the target's range
     float fuseBias=0.0f;       // frames added to the computed fuse
     int fuseMin=4;             // never burst closer than this many frames
@@ -57,7 +59,7 @@ constexpr std::size_t kInputSlot=55;
 // Vehicle
 constexpr std::size_t kMatrix=0x60,kPosition=0x90,kDead=0x2E8,kSeats=0x608,kSeatCount=0x618,kTurn=0x2AA0;
 // Seat (stride 0x340): weapon holders, aim controller, rider stick
-constexpr std::size_t kSeatStride=0x340,kSeatWeapons=0xC8,kSeatWeaponCount=0xD8,kSeatAim=0xE0;
+constexpr std::size_t kSeatStride=0x340,kSeatWeapons=0xC8,kSeatWeaponCount=0xD8,kSeatAim=0xE0,kStick=0x2D0;
 constexpr std::size_t kHolderWeapon=0x10;
 // VehicleWeaponAim: axes at +0x10, stride 0x40; {min, max, angle, velocity, ...}
 constexpr std::size_t kAimAxes=0x10,kAxisStride=0x40,kAxisMin=0x0,kAxisMax=0x4,kAxisAngle=0x8;
@@ -139,6 +141,9 @@ struct Track {
     float axis[2];         // last yaw/pitch angle
     float in[2];           // last input written
     float k[2];            // learned rad per frame per unit input
+    bool dragging;         // the rider is aiming by hand
+    const void* dropped;   // target dragged away from
+    ULONGLONG droppedUntil;
     ULONGLONG at;          // last update tick
     ULONGLONG loggedAt;
 };
@@ -376,7 +381,7 @@ void AimAngles(const float* local,float& yaw,float& pitch) noexcept {
 // from within tracking range: any air target beats any ground one, then distance plus the turn it
 // costs from where the guns point now. Returns the enemy object; `world` is its aim point, always
 // taken from the object's first lock point so the lead sees a steady track.
-const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,const void* keep,bool& armed,float* world,float& speed) noexcept {
+const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,const void* keep,const void* dropped,bool& armed,float* world,float& speed) noexcept {
     armed=false;speed=0.0f;
     float range=0.0f;
     const auto holders=At<const unsigned char* const*>(seat,kSeatWeapons);
@@ -413,6 +418,7 @@ const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,co
         break;
     }
     for(int i=0;!kept && i<enemyCount;++i) {
+        if(enemies[i].object==dropped)continue;
         float l[3];ToLocal(vehicle,enemies[i].pos,l);
         const float distance=std::sqrt(Dot(l,l));
         if(distance>track || !reachable(l))continue;
@@ -507,8 +513,17 @@ void Steer(unsigned char* vehicle) noexcept {
     Track& track=TrackFor(vehicle);
     const auto now=GetTickCount64();
     bool armed=false;float world[3]{},local[3]{},speed=0.0f;
-    const auto target=PickTarget(vehicle,seat,track.target,armed,world,speed);
+    // Holding the aim stick aims by hand (the stock input already turned it); letting go hands the
+    // turret back at once, to a target near where it was dragged, never the one dragged away from.
+    const float stick[2]={At<float>(seat,kStick),At<float>(seat,kStick+4)};
+    const bool drag=cfg.dragDeadzone>0.0f && (std::fabs(stick[0])>cfg.dragDeadzone || std::fabs(stick[1])>cfg.dragDeadzone);
+    if(drag && !track.dragging && track.target){track.dropped=track.target;track.droppedUntil=now+cfg.dragDropMs;}
+    track.dragging=drag;
+    if(drag)track.target=nullptr;
+    const void* dropped=now<track.droppedUntil ? track.dropped : nullptr;
+    const auto target=PickTarget(vehicle,seat,track.target,dropped,armed,world,speed);
     if(!armed){diag.stop="unarmed";return;}       // a stock flak: leave it alone
+    if(drag){diag.stop="manual";SetFuses(seat,-1.0f);track.at=now;return;}
     if(!target){diag.stop="no-target";SetFuses(seat,-1.0f);track.at=now;track.target=nullptr;return;}
     diag.stop="aiming";
     Lead(vehicle,track,target,world,local,speed);
@@ -650,6 +665,8 @@ void LoadConfig() noexcept {
     next.trackRange=Clamp(ReadFloat(L"TrackRange",next.trackRange),0.0f,1.0f);
     next.feedForward=GetPrivateProfileIntW(L"AutoTurret",L"FeedForward",1,iniPath)!=0;
     next.slewWeight=Clamp(ReadFloat(L"SlewWeight",next.slewWeight),0.0f,5000.0f);
+    next.dragDeadzone=Clamp(ReadFloat(L"DragDeadzone",next.dragDeadzone),0.0f,1.0f);
+    next.dragDropMs=GetPrivateProfileIntW(L"AutoTurret",L"DragDropMs",next.dragDropMs,iniPath);
     next.fuse=GetPrivateProfileIntW(L"AutoTurret",L"FuseToTarget",1,iniPath)!=0;
     next.fuseBias=ReadFloat(L"FuseBiasFrames",next.fuseBias);
     next.fuseMin=GetPrivateProfileIntW(L"AutoTurret",L"FuseMinFrames",next.fuseMin,iniPath);
@@ -657,9 +674,9 @@ void LoadConfig() noexcept {
     next.contact=GetPrivateProfileIntW(L"AutoTurret",L"ContactFuse",1,iniPath)!=0;
     next.burstVisual=Clamp(ReadFloat(L"BurstVisualScale",next.burstVisual),0.2f,10.0f);
     cfg=next;
-    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d track=%.2f ff=%d slew=%.0f fuse=%d%+.1f min=%d proximity=%.1f contact=%d",
+    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d track=%.2f ff=%d slew=%.0f drag=%.2f/%lums fuse=%d%+.1f min=%d proximity=%.1f contact=%d",
         cfg.enabled,cfg.debug,cfg.gain,cfg.yawSign,cfg.yawOffset,cfg.pitchSign,cfg.pitchOffset,cfg.pivotHeight,
-        cfg.airHeight,cfg.lead,cfg.trackRange,cfg.feedForward,cfg.slewWeight,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact);
+        cfg.airHeight,cfg.lead,cfg.trackRange,cfg.feedForward,cfg.slewWeight,cfg.dragDeadzone,cfg.dragDropMs,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact);
 }
 
 FILETIME IniStamp() noexcept {
