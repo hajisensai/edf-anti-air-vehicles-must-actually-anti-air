@@ -42,6 +42,7 @@ struct Config {
     int fuseMin=4;             // never burst closer than this many frames
     float proximity=6.0f;      // burst when a round passes this close to a locked target (0 = off)
     bool contact=true;         // burst the moment a round sticks to something or stops
+    int maxLocks=8;            // lock slots per gun; the data can only give 1 (min(AmmoCount, FireBurstCount))
 };
 Config cfg{};
 FILETIME iniStamp{};
@@ -59,6 +60,11 @@ constexpr std::size_t kHolderWeapon=0x10;
 constexpr std::size_t kAimAxes=0x10,kAxisStride=0x40,kAxisMin=0x0,kAxisMax=0x4,kAxisAngle=0x8;
 // Weapon: lock-on profile and std::list<{shared_ptr<LockInfo>, float out-of-cone frames}>
 constexpr std::size_t kLockonType=0x6B0,kLockList=0xC60;
+// Lock slots: the auto-lock (0x6965F4) adds a target only while the list is shorter than this.
+// The parser sets it to min(AmmoCount, FireBurstCount) for DistributionType 0 (0x68D402); the fire
+// path never reads it, so raising it only lets the list hold every target in range.
+constexpr std::size_t kLockMax=0x6DC;
+constexpr std::int32_t kOurLockonType=4;
 // Weapon ammo parameters, copied into each round when it is fired
 constexpr std::size_t kAmmoSpeed=0x894,kAmmoAlive=0x898;
 constexpr std::size_t kNodeInfo=0x10,kNodeCtrl=0x18;
@@ -306,10 +312,11 @@ void* __fastcall DtorHook(void* bullet,unsigned flags) {
     return originalDtor(bullet,flags);
 }
 
-// Best lock across the seat's guns: any air target beats any ground one, nearest first.
-const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char* seat,bool& armed,float* local,float& speed) noexcept {
+// Target across the seat's guns' locks: the one already being tracked while it stays locked,
+// otherwise any air target beats any ground one, nearest first.
+const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char* seat,const void* keep,bool& armed,float* local,float& speed) noexcept {
     armed=false;speed=0.0f;
-    const unsigned char* best=nullptr;float bestScore=0.0f;
+    const unsigned char* best=nullptr;float bestScore=0.0f;bool kept=false;
     const auto holders=At<const unsigned char* const*>(seat,kSeatWeapons);
     const auto count=At<std::uint64_t>(seat,kSeatWeaponCount);
     if(count>8 || !Readable(holders,count*8))return nullptr;
@@ -319,6 +326,9 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
         if(!Readable(weapon,kLockList+0x10) || !At<std::int32_t>(weapon,kLockonType))continue;
         armed=true;++diag.weapons;speed=At<float>(weapon,kAmmoSpeed);
         HookSpawn(weapon);
+        if(At<std::int32_t>(weapon,kLockonType)==kOurLockonType && At<std::int32_t>(weapon,kLockMax)<cfg.maxLocks
+           && Readable(weapon+kLockMax,4,true))
+            Put<std::int32_t>(const_cast<unsigned char*>(weapon),kLockMax,cfg.maxLocks);
         diag.listed+=static_cast<unsigned>(At<std::uint64_t>(weapon,kLockList+8));
         const auto head=At<const unsigned char*>(weapon,kLockList);
         if(!Readable(head,0x10))continue;
@@ -333,6 +343,8 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
             ToLocal(vehicle,world,l);
             const float distance=std::sqrt(Dot(l,l));
             const float score=distance+(l[1]>cfg.airHeight ? 0.0f : 1.0e6f);
+            if(kept)continue;
+            if(target==keep){kept=true;best=target;std::memcpy(local,l,sizeof(l));continue;}
             if(!best || score<bestScore){best=target;bestScore=score;std::memcpy(local,l,sizeof(l));}
         }
     }
@@ -392,12 +404,13 @@ void Steer(unsigned char* vehicle) noexcept {
     const float stickX=At<float>(seat,kStick),stickY=At<float>(seat,kStick+4);
     if(std::fabs(stickX)>cfg.overrideDeadzone || std::fabs(stickY)>cfg.overrideDeadzone)track.manualUntil=now+cfg.overrideMs;
     bool armed=false;float local[3]{},speed=0.0f;
-    const auto target=PickTarget(vehicle,seat,armed,local,speed);
+    const auto target=PickTarget(vehicle,seat,track.target,armed,local,speed);
     if(!armed){diag.stop="unarmed";return;}       // a stock flak: leave it alone
     if(!target){diag.stop="no-target";SetFuses(seat,-1.0f);track.at=now;track.target=nullptr;return;}
     if(now<track.manualUntil) {
-        diag.stop="manual";SetFuses(seat,std::sqrt(Dot(local,local)));
-        track.at=now;track.target=nullptr;return;
+        // Keep sampling the target so it is still followed (with a valid lead) once the stick is released.
+        diag.stop="manual";Lead(vehicle,track,target,local,speed);SetFuses(seat,std::sqrt(Dot(local,local)));
+        track.at=now;return;
     }
     diag.stop="aiming";
     Lead(vehicle,track,target,local,speed);
@@ -544,10 +557,13 @@ void LoadConfig() noexcept {
     next.fuseMin=GetPrivateProfileIntW(L"AutoTurret",L"FuseMinFrames",next.fuseMin,iniPath);
     next.proximity=ReadFloat(L"ProximityRadius",next.proximity);
     next.contact=GetPrivateProfileIntW(L"AutoTurret",L"ContactFuse",1,iniPath)!=0;
+    next.maxLocks=static_cast<int>(GetPrivateProfileIntW(L"AutoTurret",L"MaxLocks",next.maxLocks,iniPath));
+    if(next.maxLocks<1)next.maxLocks=1;
+    if(next.maxLocks>kMaxLocks)next.maxLocks=kMaxLocks;
     cfg=next;
-    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d override=%.2f/%lums fuse=%d%+.1f min=%d proximity=%.1f contact=%d",
+    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d override=%.2f/%lums fuse=%d%+.1f min=%d proximity=%.1f contact=%d locks=%d",
         cfg.enabled,cfg.debug,cfg.gain,cfg.yawSign,cfg.yawOffset,cfg.pitchSign,cfg.pitchOffset,cfg.pivotHeight,
-        cfg.airHeight,cfg.lead,cfg.overrideDeadzone,cfg.overrideMs,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact);
+        cfg.airHeight,cfg.lead,cfg.overrideDeadzone,cfg.overrideMs,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact,cfg.maxLocks);
 }
 
 FILETIME IniStamp() noexcept {
