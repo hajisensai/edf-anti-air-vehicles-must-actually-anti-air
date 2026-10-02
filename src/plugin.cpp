@@ -1,9 +1,11 @@
 // EDF6AutoTurret: a Vehicle603_Flak whose guns carry a lock-on profile (LockonType != 0)
-// slews its turret onto a locked target inside its tracking range by itself, preferring air
-// targets; the rider keeps the trigger, and aims by hand only while nothing is in tracking range.
-// It also time-fuses the guns' shells to the target's range, proximity-fuses them near any locked
-// target (the guns lock everything in their full range), and lets LockonType 4 guns fire without a lock (stock fire-start refuses lock-on
-// weapons with an empty lock list).
+// slews its turret onto an enemy inside its tracking range by itself, preferring air targets;
+// the rider keeps the trigger, and aims by hand only while nothing is in tracking range.
+// Enemies come straight from the game's lock-target registry (every lockable enemy, all around),
+// not from the guns' lock lists, which only cover the front hemisphere and churn.
+// It also time-fuses the guns' shells to the target's range, proximity-fuses them near any enemy
+// in range, and lets LockonType 4 guns fire without a lock (stock fire-start refuses lock-on
+// weapons with an empty lock list; our guns have LockonRange 0 so they never lock).
 // All addresses are RVAs into EDF.dll TimeDateStamp 0x678CCB46; see docs/re-notes.md.
 #include <Windows.h>
 #include <cmath>
@@ -42,7 +44,6 @@ struct Config {
     float proximity=5.0f;      // burst when a round passes this close to a target (0 = off); keep below AmmoExplosion
     bool contact=true;         // burst the moment a round sticks to something or stops
     float burstVisual=2.5f;    // burst effect size as a multiple of the stock one (AmmoExplosion/5)
-    int maxLocks=32;           // lock slots per gun; the data can only give 1 (min(AmmoCount, FireBurstCount))
 };
 Config cfg{};
 FILETIME iniStamp{};
@@ -58,20 +59,22 @@ constexpr std::size_t kSeatStride=0x340,kSeatWeapons=0xC8,kSeatWeaponCount=0xD8,
 constexpr std::size_t kHolderWeapon=0x10;
 // VehicleWeaponAim: axes at +0x10, stride 0x40; {min, max, angle, velocity, ...}
 constexpr std::size_t kAimAxes=0x10,kAxisStride=0x40,kAxisMin=0x0,kAxisMax=0x4,kAxisAngle=0x8;
-// Weapon: lock-on profile and std::list<{shared_ptr<LockInfo>, float out-of-cone frames}>
-constexpr std::size_t kLockonType=0x6B0,kLockList=0xC60;
-// Lock slots: the auto-lock (0x6965F4) adds a target only while the list is shorter than this.
-// The parser sets it to min(AmmoCount, FireBurstCount) for DistributionType 0 (0x68D402); the fire
-// path never reads it, so raising it only lets the list hold every target in range.
-constexpr std::size_t kLockMax=0x6DC;
+// Weapon: lock-on profile (LockonType 4 marks our guns)
+constexpr std::size_t kLockonType=0x6B0;
 constexpr std::int32_t kOurLockonType=4;
 // Weapon ammo parameters, copied into each round when it is fired
 constexpr std::size_t kAmmoSpeed=0x894,kAmmoAlive=0x898;
-constexpr std::size_t kNodeInfo=0x10,kNodeCtrl=0x18;
-// LockInfo: +0x08 the target object, +0x10 its aim point (kept current by the game),
-// +0x29 valid (the game itself drops a lock whose byte is 0, 0x694203)
-constexpr std::size_t kInfoAim=0x10,kInfoValid=0x29;
-constexpr int kMaxLocks=64;
+// Lock-target registry: global pointer -> object holding std::list<{raw T*, weak_ptr}> at +8.
+// Each T is one lock point of an object: +0 kind (0 = enemy kind), +8 the object, +0x10 its aim
+// point (rewritten every frame from the bone matrix by 0x6C7700), +0x29 valid, +0x2A lockable.
+// The lock query (0x696710) walks the same list; it is only touched on the game thread.
+constexpr std::size_t kRegistry=0x20B2AB0,kRegList=0x8,kNodeTarget=0x10;
+constexpr std::size_t kTargetObject=0x8,kTargetAim=0x10,kTargetValid=0x29,kTargetLockable=0x2A;
+// Team relations: manager -> array (stride 0x38) per team -> int relation[team]; 2 = enemy.
+constexpr std::size_t kTeams=0x20B2978,kTeamArray=0x38,kTeamStride=0x38,kTeamRelation=0x18;
+constexpr std::size_t kTeam=0x314;
+constexpr std::int32_t kEnemyRelation=2,kMaxTeam=64;
+constexpr int kMaxEnemies=256,kMaxNodes=8192;
 constexpr float kPi=3.14159265f;
 
 using InputFn=void(__fastcall*)(void*,std::uintptr_t);
@@ -110,12 +113,13 @@ Round rounds[kMaxRounds]{};
 int roundNext=0;
 SRWLOCK roundLock=SRWLOCK_INIT;
 
-// Aim points of every lock seen this frame, sampled in the vehicle input phase that runs
-// before the bullet update phase of the same frame.
-struct Mark { const void* info; float pos[3]; float origin[3]; ULONGLONG at; };
-constexpr int kMaxMarks=32;
-constexpr ULONGLONG kMarkMs=150;
-Mark marks[kMaxMarks]{};
+// Lock points of every enemy within gun range, sampled in the vehicle input phase that runs
+// before the bullet update phase of the same frame. One enemy can own several entries.
+struct Enemy { const void* object; float pos[3]; float origin[3]; };
+constexpr ULONGLONG kEnemyMs=150;
+Enemy enemies[kMaxEnemies]{};
+int enemyCount=0;
+ULONGLONG enemiesAt=0;
 
 struct Track {
     const void* vehicle;
@@ -130,9 +134,9 @@ Track tracks[8]{};
 struct Diag {
     ULONGLONG at;
     unsigned calls,ridden;
-    unsigned weapons,locked,listed,invalid,expired;
+    unsigned weapons,enemies,registry;
     unsigned tagged,proximity,contact;
-    float nearest;         // closest any tagged round came to a lock aim point, metres
+    float nearest;         // closest any tagged round came to an enemy aim point, metres
     const char* stop;
 };
 Diag diag{};
@@ -174,16 +178,8 @@ Track& TrackFor(const void* vehicle) noexcept {
     return *slot;
 }
 
-bool Alive(const unsigned char* node) noexcept {
-    const auto info=At<const unsigned char*>(node,kNodeInfo);
-    const auto ctrl=At<const unsigned char*>(node,kNodeCtrl);
-    if(!info || !Readable(ctrl,0x10) || At<std::int32_t>(ctrl,8)<=0 || !Readable(info,kInfoValid+1)){++diag.expired;return false;}
-    if(!info[kInfoValid])++diag.invalid;
-    return info[kInfoValid]!=0;
-}
-
-bool AimPoint(const unsigned char* info,float* out) noexcept {
-    for(int i=0;i<3;++i){out[i]=At<float>(info,kInfoAim+i*4);if(!std::isfinite(out[i]))return false;}
+bool Finite(const unsigned char* base,std::size_t offset,float* out) noexcept {
+    for(int i=0;i<3;++i){out[i]=At<float>(base,offset+i*4);if(!std::isfinite(out[i]))return false;}
     return true;
 }
 
@@ -194,14 +190,42 @@ void ToLocal(const unsigned char* vehicle,const float* world,float* local) noexc
     local[0]=Dot(d,m);local[1]=Dot(d,m+4)-cfg.pivotHeight;local[2]=Dot(d,m+8);
 }
 
-void Remember(const void* info,const float* world,const float* origin) noexcept {
-    Mark* slot=&marks[0];
-    for(auto& m:marks) {
-        if(m.info==info){slot=&m;break;}
-        if(m.at<slot->at)slot=&m;
+// The relation row of `team`, or null. Called on the game thread inside Steer's __try.
+const std::int32_t* Relations(std::int32_t team) noexcept {
+    if(team<0 || team>=kMaxTeam)return nullptr;
+    const auto manager=At<const unsigned char*>(image,kTeams);
+    if(!Readable(manager,kTeamArray+8))return nullptr;
+    const auto rows=At<const unsigned char*>(manager,kTeamArray);
+    if(!Readable(rows+team*kTeamStride,kTeamStride))return nullptr;
+    const auto relation=At<const std::int32_t*>(rows+team*kTeamStride,kTeamRelation);
+    return Readable(relation,kMaxTeam*4) ? relation : nullptr;
+}
+
+// Snapshot every live, lockable enemy lock point within `range` of the turret pivot.
+// Runs inside Steer's __try; the list is the game's own and is only changed on this thread.
+void ScanEnemies(const unsigned char* vehicle,float range) noexcept {
+    enemyCount=0;enemiesAt=GetTickCount64();
+    const auto relation=Relations(At<std::int32_t>(vehicle,kTeam));
+    const auto registry=At<const unsigned char*>(image,kRegistry);
+    if(!relation || !Readable(registry,kRegList+0x10))return;
+    const auto head=At<const unsigned char*>(registry,kRegList);
+    if(!Readable(head,0x10))return;
+    int n=0;
+    for(auto node=At<const unsigned char*>(head,0);node!=head && n<kMaxNodes;node=At<const unsigned char*>(node,0),++n) {
+        const auto target=At<const unsigned char*>(node,kNodeTarget);
+        if(!target || target[0]!=0 || !target[kTargetValid] || !target[kTargetLockable])continue;
+        const auto object=At<const unsigned char*>(target,kTargetObject);
+        if(!object || object==vehicle || object[kDead])continue;
+        const auto team=At<std::int32_t>(object,kTeam);
+        if(team<0 || team>=kMaxTeam || relation[team]!=kEnemyRelation)continue;
+        float world[3],origin[3],local[3];
+        if(!Finite(target,kTargetAim,world) || !Finite(object,kPosition,origin))continue;
+        ToLocal(vehicle,world,local);
+        if(Dot(local,local)>range*range || enemyCount>=kMaxEnemies)continue;
+        Enemy& e=enemies[enemyCount++];
+        e.object=object;std::memcpy(e.pos,world,sizeof(world));std::memcpy(e.origin,origin,sizeof(origin));
     }
-    slot->info=info;std::memcpy(slot->pos,world,sizeof(slot->pos));std::memcpy(slot->origin,origin,sizeof(slot->origin));
-    slot->at=GetTickCount64();
+    diag.registry+=static_cast<unsigned>(n);diag.enemies+=static_cast<unsigned>(enemyCount);
 }
 
 void Tag(const void* bullet) noexcept {
@@ -260,13 +284,13 @@ void HookSpawn(const unsigned char* weapon) noexcept {
         static_cast<unsigned long long>(static_cast<unsigned char*>(original)-image),ok);
 }
 
-// Closest approach of this frame's flight segment to the recent lock aim points.
-const Mark* NearTarget(const float* pos,const float* step,float* burst) noexcept {
-    const auto now=GetTickCount64();
+// Closest approach of this frame's flight segment to the enemies seen this frame.
+const Enemy* NearTarget(const float* pos,const float* step,float* burst) noexcept {
+    if(GetTickCount64()-enemiesAt>kEnemyMs)return nullptr;
     const float stepLength=Dot(step,step);
-    float best=1.0e18f;const Mark* hit=nullptr;
-    for(const auto& m:marks) {
-        if(!m.info || now-m.at>kMarkMs)continue;
+    float best=1.0e18f;const Enemy* hit=nullptr;
+    for(int i=0;i<enemyCount;++i) {
+        const Enemy& m=enemies[i];
         const float d[3]={m.pos[0]-pos[0],m.pos[1]-pos[1],m.pos[2]-pos[2]};
         const float t=stepLength>1e-6f ? Clamp(Dot(d,step)/stepLength,0.0f,1.0f) : 0.0f;
         const float q[3]={pos[0]+step[0]*t,pos[1]+step[1]*t,pos[2]+step[2]*t};
@@ -292,7 +316,7 @@ void Fuze(unsigned char* bullet) noexcept {
     if(!burst && cfg.proximity>0.0f) {
         const float step[3]={vel[0]/60.0f,vel[1]/60.0f,vel[2]/60.0f};
         float at[3];
-        if(const Mark* m=NearTarget(pos,step,at)) {
+        if(const Enemy* m=NearTarget(pos,step,at)) {
             burst=true;++diag.proximity;
             if(cfg.debug && diag.proximity<=4) {
                 const float a[3]={m->pos[0]-at[0],m->pos[1]-at[1],m->pos[2]-at[2]};
@@ -327,54 +351,44 @@ void* __fastcall DtorHook(void* bullet,unsigned flags) {
 
 std::int32_t BaseAlive(unsigned char* weapon) noexcept;
 
-// Target across the seat's guns' locks within tracking range: the one already being tracked
-// while it stays there, otherwise any air target beats any ground one, nearest first.
-// Every lock, in range or not, is remembered for the proximity fuse.
-const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char* seat,const void* keep,bool& armed,float* local,float& speed) noexcept {
+// Enemy within tracking range: the one already being tracked while it stays there, otherwise
+// any air target beats any ground one, nearest first. Returns the enemy object; `world` is its
+// aim point, always taken from the object's first lock point so the lead sees a steady track.
+const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,const void* keep,bool& armed,float* world,float& speed) noexcept {
     armed=false;speed=0.0f;
-    const unsigned char* best=nullptr;float bestScore=0.0f;bool kept=false;
+    float range=0.0f;
     const auto holders=At<const unsigned char* const*>(seat,kSeatWeapons);
     const auto count=At<std::uint64_t>(seat,kSeatWeaponCount);
     if(count>8 || !Readable(holders,count*8))return nullptr;
     for(std::uint64_t i=0;i<count;++i) {
         if(!Readable(holders[i],kHolderWeapon+8))continue;
         const auto weapon=At<const unsigned char*>(holders[i],kHolderWeapon);
-        if(!Readable(weapon,kLockList+0x10) || !At<std::int32_t>(weapon,kLockonType))continue;
+        if(!Readable(weapon,kAmmoAlive+4) || At<std::int32_t>(weapon,kLockonType)!=kOurLockonType)continue;
         armed=true;++diag.weapons;speed=At<float>(weapon,kAmmoSpeed);
-        const float reach=cfg.trackRange*speed*static_cast<float>(BaseAlive(const_cast<unsigned char*>(weapon)));
+        const float reach=speed*static_cast<float>(BaseAlive(const_cast<unsigned char*>(weapon)));
+        if(reach>range)range=reach;
         HookSpawn(weapon);
-        if(At<std::int32_t>(weapon,kLockonType)==kOurLockonType && At<std::int32_t>(weapon,kLockMax)<cfg.maxLocks
-           && Readable(weapon+kLockMax,4,true))
-            Put<std::int32_t>(const_cast<unsigned char*>(weapon),kLockMax,cfg.maxLocks);
-        diag.listed+=static_cast<unsigned>(At<std::uint64_t>(weapon,kLockList+8));
-        const auto head=At<const unsigned char*>(weapon,kLockList);
-        if(!Readable(head,0x10))continue;
-        const unsigned char* node=At<const unsigned char*>(head,0);
-        for(int n=0;n<kMaxLocks && node!=head && Readable(node,0x28);++n,node=At<const unsigned char*>(node,0)) {
-            if(!Alive(node))continue;
-            ++diag.locked;
-            const auto target=At<const unsigned char*>(node,kNodeInfo);
-            float world[3],l[3];
-            if(!AimPoint(target,world))continue;
-            const auto object=At<const unsigned char*>(target,8);
-            float origin[3];
-            if(Readable(object,kPosition+12))std::memcpy(origin,object+kPosition,sizeof(origin));
-            else std::memcpy(origin,world,sizeof(origin));
-            Remember(target,world,origin);
-            ToLocal(vehicle,world,l);
-            const float distance=std::sqrt(Dot(l,l));
-            const float score=distance+(l[1]>cfg.airHeight ? 0.0f : 1.0e6f);
-            if(kept || distance>reach)continue;
-            if(target==keep){kept=true;best=target;std::memcpy(local,l,sizeof(l));continue;}
-            if(!best || score<bestScore){best=target;bestScore=score;std::memcpy(local,l,sizeof(l));}
-        }
     }
+    if(!armed)return nullptr;
+    ScanEnemies(vehicle,range);
+    const float track=cfg.trackRange*range;
+    const void* best=nullptr;float bestScore=0.0f;
+    for(int i=0;i<enemyCount;++i) {
+        float l[3];ToLocal(vehicle,enemies[i].pos,l);
+        const float distance=std::sqrt(Dot(l,l));
+        if(distance>track)continue;
+        if(enemies[i].object==keep){best=keep;break;}
+        const float score=distance+(l[1]>cfg.airHeight ? 0.0f : 1.0e6f);
+        if(!best || score<bestScore){best=enemies[i].object;bestScore=score;}
+    }
+    if(!best)return nullptr;
+    for(int i=0;i<enemyCount;++i)
+        if(enemies[i].object==best){std::memcpy(world,enemies[i].pos,sizeof(enemies[i].pos));break;}
     return best;
 }
 
-void Lead(const unsigned char* vehicle,Track& track,const unsigned char* target,float* local,float speed) noexcept {
-    float world[3];
-    if(!AimPoint(target,world))return;
+void Lead(const unsigned char* vehicle,Track& track,const void* target,const float* world,float* local,float speed) noexcept {
+    ToLocal(vehicle,world,local);
     const auto now=GetTickCount64();
     if(track.target==target && cfg.lead && speed>0.01f && now-track.at<200) {
         // Per-frame target velocity from the last sample; the frame is ~1/60 s.
@@ -384,7 +398,7 @@ void Lead(const unsigned char* vehicle,Track& track,const unsigned char* target,
         const float ahead[3]={world[0]+v[0]*t,world[1]+v[1]*t,world[2]+v[2]*t};
         ToLocal(vehicle,ahead,local);
     }
-    track.target=target;std::memcpy(track.last,world,sizeof(world));
+    track.target=target;std::memcpy(track.last,world,sizeof(track.last));
 }
 
 std::int32_t BaseAlive(unsigned char* weapon) noexcept {
@@ -402,7 +416,7 @@ void SetFuses(const unsigned char* seat,float distance) noexcept {
     for(std::uint64_t i=0;i<count;++i) {
         if(!Readable(holders[i],kHolderWeapon+8))continue;
         const auto weapon=At<unsigned char*>(holders[i],kHolderWeapon);
-        if(!Readable(weapon,kLockList+0x10,true) || !At<std::int32_t>(weapon,kLockonType))continue;
+        if(!Readable(weapon,kAmmoAlive+4,true) || At<std::int32_t>(weapon,kLockonType)!=kOurLockonType)continue;
         const std::int32_t base=BaseAlive(weapon);
         const float speed=At<float>(weapon,kAmmoSpeed);
         std::int32_t alive=base;
@@ -422,12 +436,12 @@ void Steer(unsigned char* vehicle) noexcept {
     if(!Readable(seat,kSeatStride))return;
     Track& track=TrackFor(vehicle);
     const auto now=GetTickCount64();
-    bool armed=false;float local[3]{},speed=0.0f;
-    const auto target=PickTarget(vehicle,seat,track.target,armed,local,speed);
+    bool armed=false;float world[3]{},local[3]{},speed=0.0f;
+    const auto target=PickTarget(vehicle,seat,track.target,armed,world,speed);
     if(!armed){diag.stop="unarmed";return;}       // a stock flak: leave it alone
     if(!target){diag.stop="no-target";SetFuses(seat,-1.0f);track.at=now;track.target=nullptr;return;}
     diag.stop="aiming";
-    Lead(vehicle,track,target,local,speed);
+    Lead(vehicle,track,target,world,local,speed);
     SetFuses(seat,std::sqrt(Dot(local,local)));
     track.at=now;
     const auto axes=seat+kSeatAim+kAimAxes;
@@ -454,8 +468,8 @@ void ReloadConfigIfChanged() noexcept;
 void FlushDiag(const void* vehicle) noexcept {
     const auto now=GetTickCount64();
     if(!cfg.debug || now-diag.at<1000)return;
-    if(diag.at)Log("DIAG v=%p calls=%u ridden=%u weapons=%u listed=%u locked=%u invalid=%u expired=%u rounds=%u prox=%u contact=%u nearest=%.1fm last=%s",
-        vehicle,diag.calls,diag.ridden,diag.weapons,diag.listed,diag.locked,diag.invalid,diag.expired,
+    if(diag.at)Log("DIAG v=%p calls=%u ridden=%u weapons=%u registry=%u enemies=%u rounds=%u prox=%u contact=%u nearest=%.1fm last=%s",
+        vehicle,diag.calls,diag.ridden,diag.weapons,diag.registry,diag.enemies,
         diag.tagged,diag.proximity,diag.contact,diag.nearest,diag.stop?diag.stop:"-");
     diag=Diag{};diag.at=now;diag.nearest=1.0e9f;
 }
@@ -571,13 +585,10 @@ void LoadConfig() noexcept {
     next.proximity=ReadFloat(L"ProximityRadius",next.proximity);
     next.contact=GetPrivateProfileIntW(L"AutoTurret",L"ContactFuse",1,iniPath)!=0;
     next.burstVisual=Clamp(ReadFloat(L"BurstVisualScale",next.burstVisual),0.2f,10.0f);
-    next.maxLocks=static_cast<int>(GetPrivateProfileIntW(L"AutoTurret",L"MaxLocks",next.maxLocks,iniPath));
-    if(next.maxLocks<1)next.maxLocks=1;
-    if(next.maxLocks>kMaxLocks)next.maxLocks=kMaxLocks;
     cfg=next;
-    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d track=%.2f fuse=%d%+.1f min=%d proximity=%.1f contact=%d locks=%d",
+    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d track=%.2f fuse=%d%+.1f min=%d proximity=%.1f contact=%d",
         cfg.enabled,cfg.debug,cfg.gain,cfg.yawSign,cfg.yawOffset,cfg.pitchSign,cfg.pitchOffset,cfg.pivotHeight,
-        cfg.airHeight,cfg.lead,cfg.trackRange,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact,cfg.maxLocks);
+        cfg.airHeight,cfg.lead,cfg.trackRange,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact);
 }
 
 FILETIME IniStamp() noexcept {

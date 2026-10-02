@@ -149,7 +149,9 @@ def build_gun(side: str) -> bytes:
         r.set(k, py(v))
     for k, v in GUN_LOCKON.items():
         r.set(k, py(v))
-    r.set('LockonRange', gun_range())
+    # The plugin finds enemies itself (the game's lock-target registry); a zero lock range keeps the
+    # guns from locking at all, so no lock markers flicker. The fire gate lets LockonType 4 fire unlocked.
+    r.set('LockonRange', 0.0)
     set_names(r, GUN_NAMES[side])
     return dsgo.write(doc)
 
