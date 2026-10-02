@@ -1,0 +1,54 @@
+name: Build
+
+# Builds EDF6AutoTurret.dll on every push and pull request. Push a tag vX.Y.Z to also publish a
+# GitHub Release with the plugin and the weapon-data builder; the weapon files themselves are
+# derived from the game's data and are built by each player from their own install.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build plugin
+        shell: cmd
+        run: call build.cmd
+
+      - name: Check data tools compile
+        shell: pwsh
+        run: python -m py_compile tools/build.py tools/dsgo.py tools/gamefs.py third_party/edf6-cpk/cpk.py third_party/edf6-cpk/crilayla.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "build-$($env:GITHUB_SHA.Substring(0,7))" }
+          $name = "EDF6AntiAir-$version"
+          $root = Join-Path 'build' $name
+          New-Item -ItemType Directory -Force "$root/Mods/Plugins", "$root/tools", "$root/third_party" | Out-Null
+          Copy-Item dist/Mods/Plugins/EDF6AutoTurret.dll, dist/Mods/Plugins/EDF6AutoTurret.ini "$root/Mods/Plugins/"
+          Copy-Item tools/build.py, tools/dsgo.py, tools/gamefs.py "$root/tools/"
+          Copy-Item third_party/edf6-cpk "$root/third_party/" -Recurse
+          Copy-Item README.md, README.zh-CN.md, LICENSE $root
+          Compress-Archive -Path "$root/*" -DestinationPath "build/$name.zip"
+          "PACKAGE=$name" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: build/${{ env.PACKAGE }}.zip
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME "build/$env:PACKAGE.zip" --title $env:GITHUB_REF_NAME --generate-notes

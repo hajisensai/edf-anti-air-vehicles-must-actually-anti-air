@@ -2,8 +2,8 @@
 import os, sys
 from functools import lru_cache
 
-GAME = os.environ.get('EDF6_DIR', r'D:\steam\steamapps\common\EARTH DEFENSE FORCE 6')
-sys.path.insert(0, os.environ.get('EDF6_PYTOOLS', r'D:\APP\edf-coop-stable-multislot\multislot\tools'))
+GAME = os.environ.get('EDF6_DIR', r'C:\Program Files (x86)\Steam\steamapps\common\EARTH DEFENSE FORCE 6')
+sys.path.insert(0, os.environ.get('EDF6_PYTOOLS', os.path.join(os.path.dirname(__file__), '..', 'third_party', 'edf6-cpk')))
 import cpk, crilayla  # noqa: E402
 
 
