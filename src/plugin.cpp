@@ -1,8 +1,8 @@
 // EDF6AutoTurret: a Vehicle603_Flak whose guns carry a lock-on profile (LockonType != 0)
-// slews its turret onto the guns' current lock target by itself, preferring air targets.
-// The rider keeps the trigger; moving the aim stick takes the turret back for a moment.
+// slews its turret onto a locked target inside its tracking range by itself, preferring air
+// targets; the rider keeps the trigger, and aims by hand only while nothing is in tracking range.
 // It also time-fuses the guns' shells to the target's range, proximity-fuses them near any locked
-// target, and lets LockonType 4 guns fire without a lock (stock fire-start refuses lock-on
+// target (the guns lock everything in their full range), and lets LockonType 4 guns fire without a lock (stock fire-start refuses lock-on
 // weapons with an empty lock list).
 // All addresses are RVAs into EDF.dll TimeDateStamp 0x678CCB46; see docs/re-notes.md.
 #include <Windows.h>
@@ -35,14 +35,13 @@ struct Config {
     float pivotHeight=2.5f;    // turret pivot above the vehicle origin, metres
     float airHeight=12.0f;     // a target this far above the pivot counts as air
     bool lead=true;            // aim ahead of moving targets, using the gun's own AmmoSpeed
-    float overrideDeadzone=0.2f;
-    DWORD overrideMs=800;      // manual stick input suspends auto-aim this long
+    float trackRange=0.75f;    // auto-aim only at targets within this share of the gun's range
     bool fuse=true;            // set each round's lifetime (its burst point) to the target's range
     float fuseBias=0.0f;       // frames added to the computed fuse
     int fuseMin=4;             // never burst closer than this many frames
     float proximity=6.0f;      // burst when a round passes this close to a locked target (0 = off)
     bool contact=true;         // burst the moment a round sticks to something or stops
-    int maxLocks=8;            // lock slots per gun; the data can only give 1 (min(AmmoCount, FireBurstCount))
+    int maxLocks=32;           // lock slots per gun; the data can only give 1 (min(AmmoCount, FireBurstCount))
 };
 Config cfg{};
 FILETIME iniStamp{};
@@ -54,7 +53,7 @@ constexpr std::size_t kInputSlot=55;
 // Vehicle
 constexpr std::size_t kMatrix=0x60,kPosition=0x90,kDead=0x2E8,kSeats=0x608,kSeatCount=0x618,kTurn=0x2AA0;
 // Seat (stride 0x340): weapon holders, aim controller, rider stick
-constexpr std::size_t kSeatStride=0x340,kSeatWeapons=0xC8,kSeatWeaponCount=0xD8,kSeatAim=0xE0,kStick=0x2D0;
+constexpr std::size_t kSeatStride=0x340,kSeatWeapons=0xC8,kSeatWeaponCount=0xD8,kSeatAim=0xE0;
 constexpr std::size_t kHolderWeapon=0x10;
 // VehicleWeaponAim: axes at +0x10, stride 0x40; {min, max, angle, velocity, ...}
 constexpr std::size_t kAimAxes=0x10,kAxisStride=0x40,kAxisMin=0x0,kAxisMax=0x4,kAxisAngle=0x8;
@@ -118,7 +117,6 @@ struct Track {
     const void* target;
     float last[3];
     ULONGLONG at;          // last update tick
-    ULONGLONG manualUntil;
     ULONGLONG loggedAt;
 };
 Track tracks[8]{};
@@ -129,6 +127,7 @@ struct Diag {
     unsigned calls,ridden;
     unsigned weapons,locked,listed,invalid,expired;
     unsigned tagged,proximity,contact;
+    float nearest;         // closest any tagged round came to a lock aim point, metres
     const char* stop;
 };
 Diag diag{};
@@ -255,19 +254,21 @@ void HookSpawn(const unsigned char* weapon) noexcept {
         static_cast<unsigned long long>(static_cast<unsigned char*>(original)-image),ok);
 }
 
-// Closest approach of this frame's flight segment to a recent lock aim point.
+// Closest approach of this frame's flight segment to the recent lock aim points.
 bool NearTarget(const float* pos,const float* step,float* burst) noexcept {
     const auto now=GetTickCount64();
     const float stepLength=Dot(step,step);
+    float best=1.0e18f;
     for(const auto& m:marks) {
         if(!m.info || now-m.at>kMarkMs)continue;
         const float d[3]={m.pos[0]-pos[0],m.pos[1]-pos[1],m.pos[2]-pos[2]};
         const float t=stepLength>1e-6f ? Clamp(Dot(d,step)/stepLength,0.0f,1.0f) : 0.0f;
         const float q[3]={pos[0]+step[0]*t,pos[1]+step[1]*t,pos[2]+step[2]*t};
         const float e[3]={m.pos[0]-q[0],m.pos[1]-q[1],m.pos[2]-q[2]};
-        if(Dot(e,e)<cfg.proximity*cfg.proximity){std::memcpy(burst,q,sizeof(q));return true;}
+        if(Dot(e,e)<best){best=Dot(e,e);std::memcpy(burst,q,sizeof(q));}
     }
-    return false;
+    if(std::sqrt(best)<diag.nearest)diag.nearest=std::sqrt(best);
+    return best<cfg.proximity*cfg.proximity;
 }
 
 // Runs before the round's own update: a fused round gets its age set to its lifetime, so the
@@ -312,8 +313,11 @@ void* __fastcall DtorHook(void* bullet,unsigned flags) {
     return originalDtor(bullet,flags);
 }
 
-// Target across the seat's guns' locks: the one already being tracked while it stays locked,
-// otherwise any air target beats any ground one, nearest first.
+std::int32_t BaseAlive(unsigned char* weapon) noexcept;
+
+// Target across the seat's guns' locks within tracking range: the one already being tracked
+// while it stays there, otherwise any air target beats any ground one, nearest first.
+// Every lock, in range or not, is remembered for the proximity fuse.
 const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char* seat,const void* keep,bool& armed,float* local,float& speed) noexcept {
     armed=false;speed=0.0f;
     const unsigned char* best=nullptr;float bestScore=0.0f;bool kept=false;
@@ -325,6 +329,7 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
         const auto weapon=At<const unsigned char*>(holders[i],kHolderWeapon);
         if(!Readable(weapon,kLockList+0x10) || !At<std::int32_t>(weapon,kLockonType))continue;
         armed=true;++diag.weapons;speed=At<float>(weapon,kAmmoSpeed);
+        const float reach=cfg.trackRange*speed*static_cast<float>(BaseAlive(const_cast<unsigned char*>(weapon)));
         HookSpawn(weapon);
         if(At<std::int32_t>(weapon,kLockonType)==kOurLockonType && At<std::int32_t>(weapon,kLockMax)<cfg.maxLocks
            && Readable(weapon+kLockMax,4,true))
@@ -343,7 +348,7 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
             ToLocal(vehicle,world,l);
             const float distance=std::sqrt(Dot(l,l));
             const float score=distance+(l[1]>cfg.airHeight ? 0.0f : 1.0e6f);
-            if(kept)continue;
+            if(kept || distance>reach)continue;
             if(target==keep){kept=true;best=target;std::memcpy(local,l,sizeof(l));continue;}
             if(!best || score<bestScore){best=target;bestScore=score;std::memcpy(local,l,sizeof(l));}
         }
@@ -401,17 +406,10 @@ void Steer(unsigned char* vehicle) noexcept {
     if(!Readable(seat,kSeatStride))return;
     Track& track=TrackFor(vehicle);
     const auto now=GetTickCount64();
-    const float stickX=At<float>(seat,kStick),stickY=At<float>(seat,kStick+4);
-    if(std::fabs(stickX)>cfg.overrideDeadzone || std::fabs(stickY)>cfg.overrideDeadzone)track.manualUntil=now+cfg.overrideMs;
     bool armed=false;float local[3]{},speed=0.0f;
     const auto target=PickTarget(vehicle,seat,track.target,armed,local,speed);
     if(!armed){diag.stop="unarmed";return;}       // a stock flak: leave it alone
     if(!target){diag.stop="no-target";SetFuses(seat,-1.0f);track.at=now;track.target=nullptr;return;}
-    if(now<track.manualUntil) {
-        // Keep sampling the target so it is still followed (with a valid lead) once the stick is released.
-        diag.stop="manual";Lead(vehicle,track,target,local,speed);SetFuses(seat,std::sqrt(Dot(local,local)));
-        track.at=now;return;
-    }
     diag.stop="aiming";
     Lead(vehicle,track,target,local,speed);
     SetFuses(seat,std::sqrt(Dot(local,local)));
@@ -440,10 +438,10 @@ void ReloadConfigIfChanged() noexcept;
 void FlushDiag(const void* vehicle) noexcept {
     const auto now=GetTickCount64();
     if(!cfg.debug || now-diag.at<1000)return;
-    if(diag.at)Log("DIAG v=%p calls=%u ridden=%u weapons=%u listed=%u locked=%u invalid=%u expired=%u rounds=%u prox=%u contact=%u last=%s",
+    if(diag.at)Log("DIAG v=%p calls=%u ridden=%u weapons=%u listed=%u locked=%u invalid=%u expired=%u rounds=%u prox=%u contact=%u nearest=%.1fm last=%s",
         vehicle,diag.calls,diag.ridden,diag.weapons,diag.listed,diag.locked,diag.invalid,diag.expired,
-        diag.tagged,diag.proximity,diag.contact,diag.stop?diag.stop:"-");
-    diag=Diag{};diag.at=now;
+        diag.tagged,diag.proximity,diag.contact,diag.nearest,diag.stop?diag.stop:"-");
+    diag=Diag{};diag.at=now;diag.nearest=1.0e9f;
 }
 
 void __fastcall HookInput(void* vehicle,std::uintptr_t hasInput) {
@@ -550,8 +548,7 @@ void LoadConfig() noexcept {
     next.pivotHeight=ReadFloat(L"PivotHeight",next.pivotHeight);
     next.airHeight=ReadFloat(L"AirHeight",next.airHeight);
     next.lead=GetPrivateProfileIntW(L"AutoTurret",L"Lead",1,iniPath)!=0;
-    next.overrideDeadzone=ReadFloat(L"OverrideDeadzone",next.overrideDeadzone);
-    next.overrideMs=GetPrivateProfileIntW(L"AutoTurret",L"OverrideMs",next.overrideMs,iniPath);
+    next.trackRange=Clamp(ReadFloat(L"TrackRange",next.trackRange),0.0f,1.0f);
     next.fuse=GetPrivateProfileIntW(L"AutoTurret",L"FuseToTarget",1,iniPath)!=0;
     next.fuseBias=ReadFloat(L"FuseBiasFrames",next.fuseBias);
     next.fuseMin=GetPrivateProfileIntW(L"AutoTurret",L"FuseMinFrames",next.fuseMin,iniPath);
@@ -561,9 +558,9 @@ void LoadConfig() noexcept {
     if(next.maxLocks<1)next.maxLocks=1;
     if(next.maxLocks>kMaxLocks)next.maxLocks=kMaxLocks;
     cfg=next;
-    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d override=%.2f/%lums fuse=%d%+.1f min=%d proximity=%.1f contact=%d locks=%d",
+    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d track=%.2f fuse=%d%+.1f min=%d proximity=%.1f contact=%d locks=%d",
         cfg.enabled,cfg.debug,cfg.gain,cfg.yawSign,cfg.yawOffset,cfg.pitchSign,cfg.pitchOffset,cfg.pivotHeight,
-        cfg.airHeight,cfg.lead,cfg.overrideDeadzone,cfg.overrideMs,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact,cfg.maxLocks);
+        cfg.airHeight,cfg.lead,cfg.trackRange,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact,cfg.maxLocks);
 }
 
 FILETIME IniStamp() noexcept {

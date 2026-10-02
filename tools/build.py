@@ -67,7 +67,8 @@ GUN_LOCKON = {
     'Lockon_FireEndToClear': 0.0, 'Lockon_AutoTimeOut': 1.0,
     'LockonAngle': [3.14, 1.57], 'LockonTime': 0.0, 'LockonFailedTime': 0.0, 'LockonHoldTime': 30.0,
 }
-TRACK_RANGE_FRACTION = 0.75  # auto-tracking (lock) range as a share of the gun's range
+# The guns lock everything within their full range (the plugin's proximity fuse needs to know where
+# enemies are); the plugin auto-aims only within TrackRange (0.75 of the range) of EDF6AutoTurret.ini.
 CALL_READY_AT_START = True  # ReloadInit 1: callable right at mission start
 
 NAMES = {
@@ -148,7 +149,7 @@ def build_gun(side: str) -> bytes:
         r.set(k, py(v))
     for k, v in GUN_LOCKON.items():
         r.set(k, py(v))
-    r.set('LockonRange', gun_range() * TRACK_RANGE_FRACTION)
+    r.set('LockonRange', gun_range())
     set_names(r, GUN_NAMES[side])
     return dsgo.write(doc)
 
