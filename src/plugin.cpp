@@ -39,8 +39,9 @@ struct Config {
     bool fuse=true;            // set each round's lifetime (its burst point) to the target's range
     float fuseBias=0.0f;       // frames added to the computed fuse
     int fuseMin=4;             // never burst closer than this many frames
-    float proximity=6.0f;      // burst when a round passes this close to a locked target (0 = off)
+    float proximity=5.0f;      // burst when a round passes this close to a target (0 = off); keep below AmmoExplosion
     bool contact=true;         // burst the moment a round sticks to something or stops
+    float burstVisual=2.5f;    // burst effect size as a multiple of the stock one (AmmoExplosion/5)
     int maxLocks=32;           // lock slots per gun; the data can only give 1 (min(AmmoCount, FireBurstCount))
 };
 Config cfg{};
@@ -86,6 +87,10 @@ constexpr std::size_t kSpawnSlot=17;
 // and the stuck-to-something byte.
 constexpr std::size_t kBulletWeakCtrl=0x30,kCtl=0x140;
 constexpr std::size_t kCtlFlags=0xAF4,kCtlAge=0xAF8,kCtlAlive=0xA08,kCtlPos=0xB80,kCtlVel=0xB90,kCtlStuck=0xC00;
+// Blast radius: the damage sphere uses C+0x788 (copied from AmmoExplosion at C+0xA20 at spawn,
+// 0x2320A9), while the burst effect is drawn with size C+0xA20/5 (0x264B92). Scaling only C+0xA20
+// right before the burst enlarges the fireball without touching the damage.
+constexpr std::size_t kCtlBlast=0x788,kCtlBlastVisual=0xA20;
 constexpr std::uint32_t kRoundDead=0x1,kRoundBurstOnExpiry=0x20;
 constexpr float kStoppedSpeed=60.0f;     // m/s; the flak leaves the barrel at ~480
 
@@ -107,7 +112,7 @@ SRWLOCK roundLock=SRWLOCK_INIT;
 
 // Aim points of every lock seen this frame, sampled in the vehicle input phase that runs
 // before the bullet update phase of the same frame.
-struct Mark { const void* info; float pos[3]; ULONGLONG at; };
+struct Mark { const void* info; float pos[3]; float origin[3]; ULONGLONG at; };
 constexpr int kMaxMarks=32;
 constexpr ULONGLONG kMarkMs=150;
 Mark marks[kMaxMarks]{};
@@ -189,13 +194,14 @@ void ToLocal(const unsigned char* vehicle,const float* world,float* local) noexc
     local[0]=Dot(d,m);local[1]=Dot(d,m+4)-cfg.pivotHeight;local[2]=Dot(d,m+8);
 }
 
-void Remember(const void* info,const float* world) noexcept {
+void Remember(const void* info,const float* world,const float* origin) noexcept {
     Mark* slot=&marks[0];
     for(auto& m:marks) {
         if(m.info==info){slot=&m;break;}
         if(m.at<slot->at)slot=&m;
     }
-    slot->info=info;std::memcpy(slot->pos,world,sizeof(slot->pos));slot->at=GetTickCount64();
+    slot->info=info;std::memcpy(slot->pos,world,sizeof(slot->pos));std::memcpy(slot->origin,origin,sizeof(slot->origin));
+    slot->at=GetTickCount64();
 }
 
 void Tag(const void* bullet) noexcept {
@@ -255,20 +261,20 @@ void HookSpawn(const unsigned char* weapon) noexcept {
 }
 
 // Closest approach of this frame's flight segment to the recent lock aim points.
-bool NearTarget(const float* pos,const float* step,float* burst) noexcept {
+const Mark* NearTarget(const float* pos,const float* step,float* burst) noexcept {
     const auto now=GetTickCount64();
     const float stepLength=Dot(step,step);
-    float best=1.0e18f;
+    float best=1.0e18f;const Mark* hit=nullptr;
     for(const auto& m:marks) {
         if(!m.info || now-m.at>kMarkMs)continue;
         const float d[3]={m.pos[0]-pos[0],m.pos[1]-pos[1],m.pos[2]-pos[2]};
         const float t=stepLength>1e-6f ? Clamp(Dot(d,step)/stepLength,0.0f,1.0f) : 0.0f;
         const float q[3]={pos[0]+step[0]*t,pos[1]+step[1]*t,pos[2]+step[2]*t};
         const float e[3]={m.pos[0]-q[0],m.pos[1]-q[1],m.pos[2]-q[2]};
-        if(Dot(e,e)<best){best=Dot(e,e);std::memcpy(burst,q,sizeof(q));}
+        if(Dot(e,e)<best){best=Dot(e,e);hit=&m;std::memcpy(burst,q,sizeof(q));}
     }
     if(std::sqrt(best)<diag.nearest)diag.nearest=std::sqrt(best);
-    return best<cfg.proximity*cfg.proximity;
+    return best<cfg.proximity*cfg.proximity ? hit : nullptr;
 }
 
 // Runs before the round's own update: a fused round gets its age set to its lifetime, so the
@@ -286,11 +292,17 @@ void Fuze(unsigned char* bullet) noexcept {
     if(!burst && cfg.proximity>0.0f) {
         const float step[3]={vel[0]/60.0f,vel[1]/60.0f,vel[2]/60.0f};
         float at[3];
-        if(NearTarget(pos,step,at)) {
+        if(const Mark* m=NearTarget(pos,step,at)) {
             burst=true;++diag.proximity;
+            if(cfg.debug && diag.proximity<=4) {
+                const float a[3]={m->pos[0]-at[0],m->pos[1]-at[1],m->pos[2]-at[2]};
+                const float o[3]={m->origin[0]-at[0],m->origin[1]-at[1],m->origin[2]-at[2]};
+                Log("BURST age=%d/%d aim=%.1fm origin=%.1fm blast=%.1fm",age,alive,std::sqrt(Dot(a,a)),std::sqrt(Dot(o,o)),At<float>(c,kCtlBlast));
+            }
             for(int i=0;i<3;++i)Put<float>(c,kCtlPos+i*4,at[i]);
         }
     }
+    if(burst || age+1>=alive)Put<float>(c,kCtlBlastVisual,At<float>(c,kCtlBlast)*cfg.burstVisual);   // bursting this update
     if(!burst)return;
     Put<std::uint32_t>(c,kCtlFlags,flags|kRoundBurstOnExpiry);
     Put<std::int32_t>(c,kCtlAge,alive);
@@ -344,7 +356,11 @@ const unsigned char* PickTarget(const unsigned char* vehicle,const unsigned char
             const auto target=At<const unsigned char*>(node,kNodeInfo);
             float world[3],l[3];
             if(!AimPoint(target,world))continue;
-            Remember(target,world);
+            const auto object=At<const unsigned char*>(target,8);
+            float origin[3];
+            if(Readable(object,kPosition+12))std::memcpy(origin,object+kPosition,sizeof(origin));
+            else std::memcpy(origin,world,sizeof(origin));
+            Remember(target,world,origin);
             ToLocal(vehicle,world,l);
             const float distance=std::sqrt(Dot(l,l));
             const float score=distance+(l[1]>cfg.airHeight ? 0.0f : 1.0e6f);
@@ -554,6 +570,7 @@ void LoadConfig() noexcept {
     next.fuseMin=GetPrivateProfileIntW(L"AutoTurret",L"FuseMinFrames",next.fuseMin,iniPath);
     next.proximity=ReadFloat(L"ProximityRadius",next.proximity);
     next.contact=GetPrivateProfileIntW(L"AutoTurret",L"ContactFuse",1,iniPath)!=0;
+    next.burstVisual=Clamp(ReadFloat(L"BurstVisualScale",next.burstVisual),0.2f,10.0f);
     next.maxLocks=static_cast<int>(GetPrivateProfileIntW(L"AutoTurret",L"MaxLocks",next.maxLocks,iniPath));
     if(next.maxLocks<1)next.maxLocks=1;
     if(next.maxLocks>kMaxLocks)next.maxLocks=kMaxLocks;
