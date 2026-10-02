@@ -397,10 +397,11 @@ const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,co
     const float yaw=At<float>(axes,kAxisAngle),pitch=At<float>(axes+kAxisStride,kAxisAngle);
     const bool aimed=std::isfinite(yaw) && std::isfinite(pitch);
     const void* best=nullptr;float bestScore=0.0f;
-    for(int i=0;i<enemyCount;++i) {
-        if(enemies[i].object==keep){best=keep;break;}    // the scan already limits it to full range
+    bool kept=false;
+    for(int i=0;keep && i<enemyCount;++i) {
+        if(enemies[i].object==keep){best=keep;kept=true;break;}    // the scan already limits it to full range
     }
-    for(int i=0;i<enemyCount && best!=keep;++i) {
+    for(int i=0;!kept && i<enemyCount;++i) {
         float l[3];ToLocal(vehicle,enemies[i].pos,l);
         const float distance=std::sqrt(Dot(l,l));
         if(distance>track)continue;
