@@ -125,6 +125,7 @@ ULONGLONG enemiesAt=0;
 
 // The turret axes turn at (input x k) rad per frame; measured from the log at ~1.1 rad/s for a
 // full input on both axes, and refined online from how far each axis actually moved.
+constexpr float kPitchMargin=0.03f;   // rad past a pitch stop still counted as reachable
 constexpr float kTurnPerInput=1.1f/60.0f,kTurnPerInputMin=0.2f/60.0f,kTurnPerInputMax=6.0f/60.0f;
 
 struct Track {
@@ -396,15 +397,25 @@ const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,co
     const auto axes=seat+kSeatAim+kAimAxes;
     const float yaw=At<float>(axes,kAxisAngle),pitch=At<float>(axes+kAxisStride,kAxisAngle);
     const bool aimed=std::isfinite(yaw) && std::isfinite(pitch);
+    // Targets the guns cannot elevate (or depress) to are out: chasing one overhead pinned the
+    // pitch at its stop while the yaw whipped around, and every round went under it.
+    const float pitchMin=At<float>(axes+kAxisStride,kAxisMin)-kPitchMargin,pitchMax=At<float>(axes+kAxisStride,kAxisMax)+kPitchMargin;
+    const auto reachable=[&](const float* l) noexcept {
+        float wantYaw,wantPitch;AimAngles(l,wantYaw,wantPitch);
+        return wantPitch>=pitchMin && wantPitch<=pitchMax;
+    };
     const void* best=nullptr;float bestScore=0.0f;
     bool kept=false;
     for(int i=0;keep && i<enemyCount;++i) {
-        if(enemies[i].object==keep){best=keep;kept=true;break;}    // the scan already limits it to full range
+        if(enemies[i].object!=keep)continue;    // the scan already limits it to full range
+        float l[3];ToLocal(vehicle,enemies[i].pos,l);
+        if(reachable(l)){best=keep;kept=true;}
+        break;
     }
     for(int i=0;!kept && i<enemyCount;++i) {
         float l[3];ToLocal(vehicle,enemies[i].pos,l);
         const float distance=std::sqrt(Dot(l,l));
-        if(distance>track)continue;
+        if(distance>track || !reachable(l))continue;
         float wantYaw,wantPitch;AimAngles(l,wantYaw,wantPitch);
         const float turn=aimed ? std::fabs(Wrap(wantYaw-yaw))+std::fabs(wantPitch-pitch) : 0.0f;
         const float score=distance+turn*cfg.slewWeight+(l[1]>cfg.airHeight ? 0.0f : 1.0e6f);
