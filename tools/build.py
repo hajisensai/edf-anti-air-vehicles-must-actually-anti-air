@@ -38,6 +38,10 @@ TURRET = [65.0, 0.3, 0.3]  # gun-L turret params, the DLC Kepler YF-HV's: the st
 # second on paper, half the bursts on screen. The real gain is the blast and the proximity fuse.
 FIRE_SLOWDOWN = 2.0
 
+# The DLC Kepler YF-HV keeps its high-velocity solid shot, durability and fast turret (already the
+# buffed Kepler); its guns only get the auto-aim marker.
+HV_GUN = 'V603_FLAK_GUNH01_DLC_{side}.SGO'
+
 # The KG7 Bohr (DLC 2) and Bohr B share one grenade-launcher pair. They keep their own rounds,
 # damage and rate (already above the same-level Barrias TZ4); they get the auto-aim in ground mode
 # (LockonTargetType 1: ground targets first, lobbed rounds, stock impact fuse), double durability
@@ -117,6 +121,15 @@ def build_gun(tier: str, side: str) -> bytes:
     return dsgo.write(doc)
 
 
+def build_hv_gun(side: str) -> bytes:
+    doc = load('WEAPON', HV_GUN.format(side=side))
+    r = doc.root
+    for k, v in GUN_LOCKON.items():
+        r.set(k, py(v))
+    r.set('LockonRange', 0.0)
+    return dsgo.write(doc)
+
+
 def build_bohr_gun(side: str) -> bytes:
     doc = load('WEAPON', BOHR_GUN.format(side=side))
     r = doc.root
@@ -151,6 +164,8 @@ def main() -> None:
     for tier in sorted(set(CALLS.values())):
         for side in SIDES:
             files[f'WEAPON/V603_FLAK_GUN{tier}_{side}.SGO'] = build_gun(tier, side)
+    for side in SIDES:
+        files[f'WEAPON/{HV_GUN.format(side=side)}'] = build_hv_gun(side)
     for name in BOHR_CALLS:
         files[f'WEAPON/{name}'] = build_call(name, None, [])   # its turret is already the fast DLC one
     for side in SIDES:

@@ -71,6 +71,10 @@ constexpr std::size_t kLockonType=0x6B0,kLockonTargetType=0x6B4;
 constexpr std::int32_t kOurLockonType=4,kGroundTargetType=1;
 // Weapon ammo parameters, copied into each round when it is fired; speed is metres per frame
 constexpr std::size_t kAmmoSpeed=0x894,kAmmoAlive=0x898,kAmmoGravity=0x8E0;
+// The round factory AmmoClass resolved to (0x68D53A); fire (0x6970A5) spawns rounds through it.
+// Only GrenadeBullet01 rounds can be fused, so only guns with its factory get a time fuse.
+constexpr std::size_t kAmmoFactory=0x7F8;
+constexpr unsigned kGrenadeFactoryVtable=0x17A1688;
 // World gravity: *(global)+0x68 is the physics world; its object at +0x20 returns the gravity
 // vector (m/s^2) from virtual slot 0. The game's own vehicle aim (0x622706) reads it this way and
 // drops a round by AmmoGravityFactor x gravity / 3600 metres per frame^2 (0x622B65).
@@ -535,15 +539,29 @@ float AxisInput(Track& track,int a,float want,float angle,float error,bool wrap)
     return in;
 }
 
-std::int32_t BaseAlive(unsigned char* weapon) noexcept {
-    for(auto& f:fuses)if(f.weapon==weapon)return f.alive;
-    for(auto& f:fuses)if(!f.weapon){f={weapon,At<std::int32_t>(weapon,kAmmoAlive)};return f.alive;}
-    fuses[0]={weapon,At<std::int32_t>(weapon,kAmmoAlive)};   // full: recycle (stale vehicles)
-    return fuses[0].alive;
+// The gun fires GrenadeBullet01 rounds, the only kind the fuses can burst early.
+bool FlakRounds(const unsigned char* weapon) noexcept {
+    const auto factory=At<const unsigned char*>(weapon,kAmmoFactory);
+    return Readable(factory,8) && At<const unsigned char*>(factory,0)==image+kGrenadeFactoryVtable;
 }
 
-// Time fuse: anti-air rounds burst after `frames` of flight; frames<0 = max range. Ground-attack
-// guns keep their stock lifetime and burst on impact.
+std::int32_t BaseAlive(unsigned char* weapon) noexcept {
+    for(auto& f:fuses)if(f.weapon==weapon)return f.alive;
+    Fuse* slot=&fuses[0];   // full: recycle (stale vehicles)
+    for(auto& f:fuses)if(!f.weapon){slot=&f;break;}
+    *slot={weapon,At<std::int32_t>(weapon,kAmmoAlive)};
+    if(cfg.debug) {
+        const auto factory=At<const unsigned char*>(weapon,kAmmoFactory);
+        const auto vtable=Readable(factory,8) ? At<const unsigned char*>(factory,0) : nullptr;
+        Log("WEAPON %p factory=+0x%llX flak=%d ground=%d speed=%.1f alive=%d gravity=%.2f",weapon,
+            static_cast<unsigned long long>(vtable ? vtable-image : 0),FlakRounds(weapon),
+            At<std::int32_t>(weapon,kLockonTargetType)==kGroundTargetType,At<float>(weapon,kAmmoSpeed),slot->alive,At<float>(weapon,kAmmoGravity));
+    }
+    return slot->alive;
+}
+
+// Time fuse: flak rounds burst after `frames` of flight; frames<0 = max range. Other rounds (the
+// HV's solid shot, the Bohr's impact grenades) keep their stock lifetime.
 void SetFuses(const unsigned char* seat,float frames) noexcept {
     const auto holders=At<unsigned char* const*>(seat,kSeatWeapons);
     const auto count=At<std::uint64_t>(seat,kSeatWeaponCount);
@@ -552,7 +570,7 @@ void SetFuses(const unsigned char* seat,float frames) noexcept {
         if(!Readable(holders[i],kHolderWeapon+8))continue;
         const auto weapon=At<unsigned char*>(holders[i],kHolderWeapon);
         if(!Readable(weapon,kAmmoAlive+4,true) || At<std::int32_t>(weapon,kLockonType)!=kOurLockonType)continue;
-        if(At<std::int32_t>(weapon,kLockonTargetType)==kGroundTargetType)continue;
+        if(!FlakRounds(weapon))continue;
         const std::int32_t base=BaseAlive(weapon);
         std::int32_t alive=base;
         if(cfg.fuse && frames>=0.0f) {
