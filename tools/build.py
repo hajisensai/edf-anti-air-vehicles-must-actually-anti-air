@@ -1,8 +1,9 @@
-"""Turn the stock KG6 Kepler anti-air vehicles into flak vehicles, into dist/Mods.
+"""Turn the stock KG6 Kepler anti-air vehicles into flak vehicles and the DLC KG7 Bohr into a
+self-aiming ground-attack launcher, into dist/Mods.
 
   python tools/build.py [--out dist/Mods]
 
-Overrides only the five stock Kepler call SGOs and their three gun pairs; no WEAPONTABLE /
+Overrides only the Kepler / Bohr call SGOs and their gun pairs; no WEAPONTABLE /
 WEAPONTEXT rows are added, so it coexists with mods that edit the tables. The guns get flak rounds
 and the LockonType 4 marker the EDF6AutoTurret plugin aims; the calls get more durability and a
 faster turret.
@@ -36,6 +37,15 @@ TURRET = [65.0, 0.3, 0.3]  # gun-L turret params, the DLC Kepler YF-HV's: the st
 # Each gun fires every 6 frames instead of 3 at twice the damage per round: the same damage per
 # second on paper, half the bursts on screen. The real gain is the blast and the proximity fuse.
 FIRE_SLOWDOWN = 2.0
+
+# The KG7 Bohr (DLC 2) and Bohr B share one grenade-launcher pair. They keep their own rounds,
+# damage and rate (already above the same-level Barrias TZ4); they get the auto-aim in ground mode
+# (LockonTargetType 1: ground targets first, lobbed rounds, stock impact fuse), double durability
+# (24500 / 29400 vs TZ4-R 60000) and a wider blast for crowds.
+BOHR_CALLS = ('MPACK_B_WEAPON025.SGO', 'MPACK_B_WEAPON028.SGO')
+BOHR_GUN = 'V603_FLAK_GLGUN01_DLC_{side}.SGO'
+BOHR_EXPLOSION = 6.0   # stock 4
+GROUND_TARGET_TYPE = 1.0
 
 # Ballistics, fire rate, tracer colour, sound and muzzle flash come from the Nereid gun;
 # model / bone / animation fields stay the Kepler gun's so the turret still works.
@@ -107,15 +117,27 @@ def build_gun(tier: str, side: str) -> bytes:
     return dsgo.write(doc)
 
 
-def build_call(name: str) -> bytes:
+def build_bohr_gun(side: str) -> bytes:
+    doc = load('WEAPON', BOHR_GUN.format(side=side))
+    r = doc.root
+    for k, v in GUN_LOCKON.items():
+        r.set(k, py(v))
+    r.set('LockonTargetType', GROUND_TARGET_TYPE)
+    r.set('LockonRange', 0.0)
+    r.set('AmmoExplosion', BOHR_EXPLOSION)
+    return dsgo.write(doc)
+
+
+def build_call(name: str, turret: list[float] | None, resources: list[str]) -> bytes:
     doc = load('WEAPON', name)
     r = doc.root
     setup = r.get('Ammo_CustomParameter').items[4].items[3]
     mul = setup.items[0]
     mul.items[0] = mul.items[0] * DURABILITY_SCALE
-    setup.items[2].items[0].items[2] = py(TURRET)
+    if turret:
+        setup.items[2].items[0].items[2] = py(turret)
     res = r.get('resource')
-    res.items += [x for x in GUN_AMMO['resource'] if x not in res.items]
+    res.items += [x for x in resources if x not in res.items]
     return dsgo.write(doc)
 
 
@@ -125,10 +147,14 @@ def main() -> None:
     out = os.path.abspath(ap.parse_args().out)
     files: dict[str, bytes] = {}
     for name in CALLS:
-        files[f'WEAPON/{name}'] = build_call(name)
+        files[f'WEAPON/{name}'] = build_call(name, TURRET, GUN_AMMO['resource'])
     for tier in sorted(set(CALLS.values())):
         for side in SIDES:
             files[f'WEAPON/V603_FLAK_GUN{tier}_{side}.SGO'] = build_gun(tier, side)
+    for name in BOHR_CALLS:
+        files[f'WEAPON/{name}'] = build_call(name, None, [])   # its turret is already the fast DLC one
+    for side in SIDES:
+        files[f'WEAPON/{BOHR_GUN.format(side=side)}'] = build_bohr_gun(side)
     for rel, data in files.items():
         dsgo.parse(data)
         path = os.path.join(out, rel)

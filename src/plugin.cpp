@@ -1,9 +1,10 @@
-// EDF6AutoTurret: a Vehicle603_Flak whose guns carry a lock-on profile (LockonType != 0)
-// slews its turret onto an enemy inside its tracking range by itself, preferring air targets;
-// the rider keeps the trigger, and aims by hand only while nothing is in tracking range.
+// EDF6AutoTurret: a Vehicle603_Flak whose guns carry our marker (LockonType 4) slews its turret
+// onto an enemy inside its tracking range by itself: anti-air guns prefer air targets, guns also
+// marked LockonTargetType 1 (the Bohr's grenade launchers) prefer ground ones. The aim solves the
+// round's ballistic arc. The rider keeps the trigger, and aims by hand while holding the stick.
 // Enemies come straight from the game's lock-target registry (every lockable enemy, all around),
 // not from the guns' lock lists, which only cover the front hemisphere and churn.
-// It also time-fuses the guns' shells to the target's range, proximity-fuses them near any enemy
+// It also time-fuses the anti-air shells to the target's range, proximity-fuses them near any enemy
 // in range, and lets LockonType 4 guns fire without a lock (stock fire-start refuses lock-on
 // weapons with an empty lock list; our guns have LockonRange 0 so they never lock).
 // All addresses are RVAs into EDF.dll TimeDateStamp 0x678CCB46; see docs/re-notes.md.
@@ -64,10 +65,17 @@ constexpr std::size_t kHolderWeapon=0x10;
 // VehicleWeaponAim: axes at +0x10, stride 0x40; {min, max, angle, velocity, ...}
 constexpr std::size_t kAimAxes=0x10,kAxisStride=0x40,kAxisMin=0x0,kAxisMax=0x4,kAxisAngle=0x8;
 // Weapon: lock-on profile (LockonType 4 marks our guns)
-constexpr std::size_t kLockonType=0x6B0;
-constexpr std::int32_t kOurLockonType=4;
-// Weapon ammo parameters, copied into each round when it is fired
-constexpr std::size_t kAmmoSpeed=0x894,kAmmoAlive=0x898;
+// LockonTargetType 1 marks a ground-attack gun: our guns never lock (LockonRange 0), and the only
+// stock reader (0x696792) just picks the lock class from it.
+constexpr std::size_t kLockonType=0x6B0,kLockonTargetType=0x6B4;
+constexpr std::int32_t kOurLockonType=4,kGroundTargetType=1;
+// Weapon ammo parameters, copied into each round when it is fired; speed is metres per frame
+constexpr std::size_t kAmmoSpeed=0x894,kAmmoAlive=0x898,kAmmoGravity=0x8E0;
+// World gravity: *(global)+0x68 is the physics world; its object at +0x20 returns the gravity
+// vector (m/s^2) from virtual slot 0. The game's own vehicle aim (0x622706) reads it this way and
+// drops a round by AmmoGravityFactor x gravity / 3600 metres per frame^2 (0x622B65).
+constexpr std::size_t kWorld=0x20B2958,kWorldPhysics=0x68,kPhysicsGravity=0x20;
+constexpr float kFramesPerSecondSq=3600.0f;
 // Lock-target registry: global pointer -> object holding std::list<{raw T*, weak_ptr}> at +8.
 // Each T is one lock point of an object: +0 kind (0 = enemy kind), +8 the object, +0x10 its aim
 // point (rewritten every frame from the bone matrix by 0x6C7700), +0x29 valid, +0x2A lockable.
@@ -159,6 +167,10 @@ struct Diag {
     const char* stop;
 };
 Diag diag{};
+
+// A gun's round as the aim sees it: muzzle speed (m/frame), the drop it picks up along the
+// vehicle's down axis (m/frame^2), and whether the gun hunts ground targets first.
+struct Shot { float speed; float drop; bool ground; };
 
 // Data AmmoAlive per gun, so the fuse can return to max range when nothing is tracked.
 struct Fuse { const void* weapon; std::int32_t alive; };
@@ -370,19 +382,60 @@ void* __fastcall DtorHook(void* bullet,unsigned flags) {
 
 std::int32_t BaseAlive(unsigned char* weapon) noexcept;
 
-// Wanted turret yaw/pitch for a point in the vehicle frame.
-void AimAngles(const float* local,float& yaw,float& pitch) noexcept {
+// Gravity along the vehicle's down axis, m/s^2: the world gravity vector rotated into the vehicle
+// frame and its down component taken, as the game's vehicle aim does. 0 if it can't be read (the
+// aim then flies straight lines, as before gravity was solved).
+float Down(const unsigned char* vehicle) noexcept {
+    const auto world=At<const unsigned char*>(image,kWorld);
+    if(!Readable(world,kWorldPhysics+8))return 0.0f;
+    const auto physics=At<unsigned char*>(world,kWorldPhysics);
+    if(!Readable(physics,kPhysicsGravity+8))return 0.0f;
+    void* object=physics+kPhysicsGravity;
+    const auto vtable=At<void* const*>(object,0);
+    if(!Readable(vtable,8) || !Readable(vtable[0],1))return 0.0f;
+    using GravityFn=const float*(__fastcall*)(void*);
+    const float* g=reinterpret_cast<GravityFn>(vtable[0])(object);
+    if(!Readable(g,12))return 0.0f;
+    const float* m=reinterpret_cast<const float*>(vehicle+kMatrix);
+    const float down=-Dot(g,m+4);
+    return std::isfinite(down) ? down : 0.0f;
+}
+
+// Elevation (rad, up positive) and flight time (frames) to hit a point in the vehicle frame on the
+// lower of the two arcs, the solve the game's vehicle aim runs (0x50350). False when out of reach.
+bool Ballistic(const float* local,const Shot& shot,float& elevation,float& time) noexcept {
+    if(shot.speed<=0.01f)return false;
+    const double x=std::sqrt(local[0]*local[0]+local[2]*local[2]),y=local[1],v=shot.speed,a=shot.drop;
+    if(a<=0.0 || x<0.01) {
+        elevation=static_cast<float>(std::atan2(y,x));
+        time=static_cast<float>(std::sqrt(x*x+y*y)/v);
+        return true;
+    }
+    const double disc=v*v*v*v-a*(a*x*x+2.0*y*v*v);
+    if(disc<0.0)return false;
+    const double e=std::atan((v*v-std::sqrt(disc))/(a*x));
+    elevation=static_cast<float>(e);
+    time=static_cast<float>(x/(v*std::cos(e)));
+    return true;
+}
+
+// Wanted turret yaw/pitch and flight time (frames) for a point in the vehicle frame.
+bool AimAngles(const float* local,const Shot& shot,float& yaw,float& pitch,float& time) noexcept {
+    float elevation;
+    if(!Ballistic(local,shot,elevation,time))return false;
     yaw=cfg.yawSign*std::atan2(local[0],local[2])+cfg.yawOffset;
-    pitch=cfg.pitchSign*std::atan2(local[1],std::sqrt(local[0]*local[0]+local[2]*local[2]))+cfg.pitchOffset;
+    pitch=cfg.pitchSign*elevation+cfg.pitchOffset;
+    return true;
 }
 
 // The tracked enemy stays the target while it lives within the gun's full range (dropping it at the
 // tracking-range edge made the turret flip between targets every second or two). A new one comes
-// from within tracking range: any air target beats any ground one, then distance plus the turn it
-// costs from where the guns point now. Returns the enemy object; `world` is its aim point, always
+// from within tracking range: any target of the gun's kind (air, or ground for a ground-attack gun)
+// beats any other, then distance plus the turn it costs from where the guns point now. Returns the enemy object; `world` is its aim point, always
 // taken from the object's first lock point so the lead sees a steady track.
-const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,const void* keep,const void* dropped,bool& armed,float* world,float& speed) noexcept {
-    armed=false;speed=0.0f;
+const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,const void* keep,const void* dropped,bool& armed,float* world,Shot& shot) noexcept {
+    armed=false;shot=Shot{};
+    float gravity=0.0f;
     float range=0.0f;
     const auto holders=At<const unsigned char* const*>(seat,kSeatWeapons);
     const auto count=At<std::uint64_t>(seat,kSeatWeaponCount);
@@ -391,40 +444,44 @@ const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,co
         if(!Readable(holders[i],kHolderWeapon+8))continue;
         const auto weapon=At<const unsigned char*>(holders[i],kHolderWeapon);
         if(!Readable(weapon,kAmmoAlive+4) || At<std::int32_t>(weapon,kLockonType)!=kOurLockonType)continue;
-        armed=true;++diag.weapons;speed=At<float>(weapon,kAmmoSpeed);
-        const float reach=speed*static_cast<float>(BaseAlive(const_cast<unsigned char*>(weapon)));
+        armed=true;++diag.weapons;
+        shot.speed=At<float>(weapon,kAmmoSpeed);
+        gravity=At<float>(weapon,kAmmoGravity);
+        shot.ground=shot.ground || At<std::int32_t>(weapon,kLockonTargetType)==kGroundTargetType;
+        const float reach=shot.speed*static_cast<float>(BaseAlive(const_cast<unsigned char*>(weapon)));
         if(reach>range)range=reach;
         HookSpawn(weapon);
     }
     if(!armed)return nullptr;
+    if(std::isfinite(gravity) && gravity>0.0f)shot.drop=gravity*Down(vehicle)/kFramesPerSecondSq;
     ScanEnemies(vehicle,range);
     const float track=cfg.trackRange*range;
     const auto axes=seat+kSeatAim+kAimAxes;
     const float yaw=At<float>(axes,kAxisAngle),pitch=At<float>(axes+kAxisStride,kAxisAngle);
     const bool aimed=std::isfinite(yaw) && std::isfinite(pitch);
-    // Targets the guns cannot elevate (or depress) to are out: chasing one overhead pinned the
-    // pitch at its stop while the yaw whipped around, and every round went under it.
+    // Targets the guns cannot elevate (or depress) to, or lob a round onto, are out: chasing one
+    // overhead pinned the pitch at its stop while the yaw whipped around, and every round went under it.
     const float pitchMin=At<float>(axes+kAxisStride,kAxisMin)-kPitchMargin,pitchMax=At<float>(axes+kAxisStride,kAxisMax)+kPitchMargin;
-    const auto reachable=[&](const float* l) noexcept {
-        float wantYaw,wantPitch;AimAngles(l,wantYaw,wantPitch);
-        return wantPitch>=pitchMin && wantPitch<=pitchMax;
+    const auto reachable=[&](const float* l,float& wantYaw,float& wantPitch) noexcept {
+        float time;
+        return AimAngles(l,shot,wantYaw,wantPitch,time) && wantPitch>=pitchMin && wantPitch<=pitchMax;
     };
     const void* best=nullptr;float bestScore=0.0f;
     bool kept=false;
     for(int i=0;keep && i<enemyCount;++i) {
         if(enemies[i].object!=keep)continue;    // the scan already limits it to full range
-        float l[3];ToLocal(vehicle,enemies[i].pos,l);
-        if(reachable(l)){best=keep;kept=true;}
+        float l[3],wantYaw,wantPitch;ToLocal(vehicle,enemies[i].pos,l);
+        if(reachable(l,wantYaw,wantPitch)){best=keep;kept=true;}
         break;
     }
     for(int i=0;!kept && i<enemyCount;++i) {
         if(enemies[i].object==dropped)continue;
-        float l[3];ToLocal(vehicle,enemies[i].pos,l);
+        float l[3],wantYaw,wantPitch;ToLocal(vehicle,enemies[i].pos,l);
         const float distance=std::sqrt(Dot(l,l));
-        if(distance>track || !reachable(l))continue;
-        float wantYaw,wantPitch;AimAngles(l,wantYaw,wantPitch);
+        if(distance>track || !reachable(l,wantYaw,wantPitch))continue;
         const float turn=aimed ? std::fabs(Wrap(wantYaw-yaw))+std::fabs(wantPitch-pitch) : 0.0f;
-        const float score=distance+turn*cfg.slewWeight+(l[1]>cfg.airHeight ? 0.0f : 1.0e6f);
+        const bool preferred=(l[1]>cfg.airHeight)!=shot.ground;
+        const float score=distance+turn*cfg.slewWeight+(preferred ? 0.0f : 1.0e6f);
         if(!best || score<bestScore){best=enemies[i].object;bestScore=score;}
     }
     if(!best)return nullptr;
@@ -435,7 +492,7 @@ const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,co
 
 // Steer runs once per game frame, so the target's velocity is its per-call displacement
 // (smoothed against bone jitter). Lead with the flight time to the lead point itself.
-void Lead(const unsigned char* vehicle,Track& track,const void* target,const float* world,float* local,float speed) noexcept {
+void Lead(const unsigned char* vehicle,Track& track,const void* target,const float* world,float* local,const Shot& shot) noexcept {
     const bool same=track.target==target && GetTickCount64()-track.at<200;
     if(!same){track.frames=0;std::memset(track.vel,0,sizeof(track.vel));}
     else {
@@ -447,10 +504,11 @@ void Lead(const unsigned char* vehicle,Track& track,const void* target,const flo
     }
     track.target=target;std::memcpy(track.last,world,sizeof(track.last));
     float aim[3];std::memcpy(aim,world,sizeof(aim));
-    if(cfg.lead && speed>0.01f && track.frames>=2) {
+    if(cfg.lead && track.frames>=2) {
         for(int pass=0;pass<2;++pass) {
             ToLocal(vehicle,aim,local);
-            const float t=std::sqrt(Dot(local,local))/speed;
+            float elevation,t;
+            if(!Ballistic(local,shot,elevation,t))break;
             for(int i=0;i<3;++i)aim[i]=world[i]+track.vel[i]*t;
         }
     }
@@ -484,8 +542,9 @@ std::int32_t BaseAlive(unsigned char* weapon) noexcept {
     return fuses[0].alive;
 }
 
-// Time fuse: rounds burst after the flight time to `distance` metres; distance<0 = max range.
-void SetFuses(const unsigned char* seat,float distance) noexcept {
+// Time fuse: anti-air rounds burst after `frames` of flight; frames<0 = max range. Ground-attack
+// guns keep their stock lifetime and burst on impact.
+void SetFuses(const unsigned char* seat,float frames) noexcept {
     const auto holders=At<unsigned char* const*>(seat,kSeatWeapons);
     const auto count=At<std::uint64_t>(seat,kSeatWeaponCount);
     if(count>8 || !Readable(holders,count*8))return;
@@ -493,12 +552,12 @@ void SetFuses(const unsigned char* seat,float distance) noexcept {
         if(!Readable(holders[i],kHolderWeapon+8))continue;
         const auto weapon=At<unsigned char*>(holders[i],kHolderWeapon);
         if(!Readable(weapon,kAmmoAlive+4,true) || At<std::int32_t>(weapon,kLockonType)!=kOurLockonType)continue;
+        if(At<std::int32_t>(weapon,kLockonTargetType)==kGroundTargetType)continue;
         const std::int32_t base=BaseAlive(weapon);
-        const float speed=At<float>(weapon,kAmmoSpeed);
         std::int32_t alive=base;
-        if(cfg.fuse && distance>=0.0f && speed>0.01f) {
-            const float frames=std::ceil(distance/speed+cfg.fuseBias);
-            alive=static_cast<std::int32_t>(Clamp(frames,static_cast<float>(cfg.fuseMin),static_cast<float>(base)));
+        if(cfg.fuse && frames>=0.0f) {
+            const float fuse=std::ceil(frames+cfg.fuseBias);
+            alive=static_cast<std::int32_t>(Clamp(fuse,static_cast<float>(cfg.fuseMin),static_cast<float>(base)));
         }
         Put<std::int32_t>(weapon,kAmmoAlive,alive);
     }
@@ -512,7 +571,7 @@ void Steer(unsigned char* vehicle) noexcept {
     if(!Readable(seat,kSeatStride))return;
     Track& track=TrackFor(vehicle);
     const auto now=GetTickCount64();
-    bool armed=false;float world[3]{},local[3]{},speed=0.0f;
+    bool armed=false;float world[3]{},local[3]{};Shot shot{};
     // Holding the aim stick aims by hand (the stock input already turned it); letting go hands the
     // turret back at once, to a target near where it was dragged, never the one dragged away from.
     const float stick[2]={At<float>(seat,kStick),At<float>(seat,kStick+4)};
@@ -521,18 +580,19 @@ void Steer(unsigned char* vehicle) noexcept {
     track.dragging=drag;
     if(drag)track.target=nullptr;
     const void* dropped=now<track.droppedUntil ? track.dropped : nullptr;
-    const auto target=PickTarget(vehicle,seat,track.target,dropped,armed,world,speed);
+    const auto target=PickTarget(vehicle,seat,track.target,dropped,armed,world,shot);
     if(!armed){diag.stop="unarmed";return;}       // a stock flak: leave it alone
     if(drag){diag.stop="manual";SetFuses(seat,-1.0f);track.at=now;return;}
     if(!target){diag.stop="no-target";SetFuses(seat,-1.0f);track.at=now;track.target=nullptr;return;}
     diag.stop="aiming";
-    Lead(vehicle,track,target,world,local,speed);
-    SetFuses(seat,std::sqrt(Dot(local,local)));
+    Lead(vehicle,track,target,world,local,shot);
     track.at=now;
+    float wantYaw,wantPitch,flight;
+    if(!AimAngles(local,shot,wantYaw,wantPitch,flight)){diag.stop="out-of-reach";SetFuses(seat,-1.0f);return;}
+    SetFuses(seat,flight);
     const auto axes=seat+kSeatAim+kAimAxes;
     const float yaw=At<float>(axes,kAxisAngle),pitch=At<float>(axes+kAxisStride,kAxisAngle);
     if(!std::isfinite(yaw) || !std::isfinite(pitch)){diag.stop="bad-axis";return;}
-    float wantYaw,wantPitch;AimAngles(local,wantYaw,wantPitch);
     wantPitch=Clamp(wantPitch,At<float>(axes+kAxisStride,kAxisMin),At<float>(axes+kAxisStride,kAxisMax));
     const bool fullCircle=At<float>(axes,kAxisMax)-At<float>(axes,kAxisMin)>=2*kPi-0.01f;
     const float yawError=fullCircle ? Wrap(wantYaw-yaw) : wantYaw-yaw;
@@ -541,8 +601,8 @@ void Steer(unsigned char* vehicle) noexcept {
     Put<float>(vehicle,kTurn,in[0]);Put<float>(vehicle,kTurn+4,in[1]);
     if(cfg.debug && now-track.loggedAt>500) {
         track.loggedAt=now;
-        Log("AIM fuse=%dm v=%p t=%p local=(%.1f,%.1f,%.1f) yaw=%.3f->%.3f pitch=%.3f->%.3f in=(%.2f,%.2f) rate=(%.2f,%.2f)/s k=(%.2f,%.2f)/s speed=%.0fm/s",
-            static_cast<int>(std::sqrt(Dot(local,local))),vehicle,target,local[0],local[1],local[2],yaw,wantYaw,pitch,wantPitch,in[0],in[1],
+        Log("AIM %s flight=%.0ff drop=%.5f v=%p t=%p local=(%.1f,%.1f,%.1f) yaw=%.3f->%.3f pitch=%.3f->%.3f in=(%.2f,%.2f) rate=(%.2f,%.2f)/s k=(%.2f,%.2f)/s speed=%.0fm/s",
+            shot.ground?"ground":"air",flight,shot.drop,vehicle,target,local[0],local[1],local[2],yaw,wantYaw,pitch,wantPitch,in[0],in[1],
             track.rate[0]*60.0f,track.rate[1]*60.0f,track.k[0]*60.0f,track.k[1]*60.0f,std::sqrt(Dot(track.vel,track.vel))*60.0f);
     }
 }
