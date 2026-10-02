@@ -38,6 +38,7 @@ struct Config {
     float airHeight=12.0f;     // a target this far above the pivot counts as air
     bool lead=true;            // aim ahead of moving targets, using the gun's own AmmoSpeed
     float trackRange=0.75f;    // auto-aim only at targets within this share of the gun's range
+    bool feedForward=true;     // drive the turret at the aim point's own angular rate, not only on the error
     bool fuse=true;            // set each round's lifetime (its burst point) to the target's range
     float fuseBias=0.0f;       // frames added to the computed fuse
     int fuseMin=4;             // never burst closer than this many frames
@@ -121,10 +122,21 @@ Enemy enemies[kMaxEnemies]{};
 int enemyCount=0;
 ULONGLONG enemiesAt=0;
 
+// The turret axes turn at (input x k) rad per frame; measured from the log at ~1.1 rad/s for a
+// full input on both axes, and refined online from how far each axis actually moved.
+constexpr float kTurnPerInput=1.1f/60.0f,kTurnPerInputMin=0.2f/60.0f,kTurnPerInputMax=6.0f/60.0f;
+
 struct Track {
     const void* vehicle;
     const void* target;
     float last[3];
+    float vel[3];          // smoothed target velocity, metres per frame
+    int frames;            // consecutive frames on this target
+    float want[2];         // last wanted yaw/pitch
+    float rate[2];         // smoothed change of the wanted angles, rad per frame
+    float axis[2];         // last yaw/pitch angle
+    float in[2];           // last input written
+    float k[2];            // learned rad per frame per unit input
     ULONGLONG at;          // last update tick
     ULONGLONG loggedAt;
 };
@@ -387,18 +399,48 @@ const void* PickTarget(const unsigned char* vehicle,const unsigned char* seat,co
     return best;
 }
 
+// Steer runs once per game frame, so the target's velocity is its per-call displacement
+// (smoothed against bone jitter). Lead with the flight time to the lead point itself.
 void Lead(const unsigned char* vehicle,Track& track,const void* target,const float* world,float* local,float speed) noexcept {
-    ToLocal(vehicle,world,local);
-    const auto now=GetTickCount64();
-    if(track.target==target && cfg.lead && speed>0.01f && now-track.at<200) {
-        // Per-frame target velocity from the last sample; the frame is ~1/60 s.
-        const float frames=Clamp((now-track.at)/16.6667f,1.0f,12.0f);
-        const float v[3]={(world[0]-track.last[0])/frames,(world[1]-track.last[1])/frames,(world[2]-track.last[2])/frames};
-        const float t=std::sqrt(Dot(local,local))/speed;
-        const float ahead[3]={world[0]+v[0]*t,world[1]+v[1]*t,world[2]+v[2]*t};
-        ToLocal(vehicle,ahead,local);
+    const bool same=track.target==target && GetTickCount64()-track.at<200;
+    if(!same){track.frames=0;std::memset(track.vel,0,sizeof(track.vel));}
+    else {
+        for(int i=0;i<3;++i) {
+            const float v=world[i]-track.last[i];
+            track.vel[i]=track.frames ? track.vel[i]+0.3f*(v-track.vel[i]) : v;
+        }
+        ++track.frames;
     }
     track.target=target;std::memcpy(track.last,world,sizeof(track.last));
+    float aim[3];std::memcpy(aim,world,sizeof(aim));
+    if(cfg.lead && speed>0.01f && track.frames>=2) {
+        for(int pass=0;pass<2;++pass) {
+            ToLocal(vehicle,aim,local);
+            const float t=std::sqrt(Dot(local,local))/speed;
+            for(int i=0;i<3;++i)aim[i]=world[i]+track.vel[i]*t;
+        }
+    }
+    ToLocal(vehicle,aim,local);
+}
+
+// Turret input for one axis: feed-forward at the wanted angle's own rate plus a correction on the
+// error. A pure proportional input lags a crossing target by rate/(gain x k), which put every
+// round behind the target.
+float AxisInput(Track& track,int a,float want,float angle,float error,bool wrap) noexcept {
+    if(track.k[a]<=0.0f)track.k[a]=kTurnPerInput;
+    if(track.frames>=1) {
+        const float wanted=wrap ? Wrap(want-track.want[a]) : want-track.want[a];
+        track.rate[a]+=0.3f*(wanted-track.rate[a]);
+        const float moved=wrap ? Wrap(angle-track.axis[a]) : angle-track.axis[a];
+        if(std::fabs(track.in[a])>0.15f) {
+            const float k=moved/track.in[a];
+            if(k>kTurnPerInputMin && k<kTurnPerInputMax)track.k[a]+=0.05f*(k-track.k[a]);
+        }
+    } else track.rate[a]=0.0f;
+    const float ff=cfg.feedForward ? track.rate[a]/track.k[a] : 0.0f;
+    const float in=Clamp(ff+error*cfg.gain,-1.0f,1.0f);
+    track.want[a]=want;track.axis[a]=angle;track.in[a]=in;
+    return in;
 }
 
 std::int32_t BaseAlive(unsigned char* weapon) noexcept {
@@ -453,13 +495,14 @@ void Steer(unsigned char* vehicle) noexcept {
     wantPitch=Clamp(wantPitch,At<float>(axes+kAxisStride,kAxisMin),At<float>(axes+kAxisStride,kAxisMax));
     const bool fullCircle=At<float>(axes,kAxisMax)-At<float>(axes,kAxisMin)>=2*kPi-0.01f;
     const float yawError=fullCircle ? Wrap(wantYaw-yaw) : wantYaw-yaw;
-    const float in[2]={Clamp(yawError*cfg.gain,-1.0f,1.0f),Clamp((wantPitch-pitch)*cfg.gain,-1.0f,1.0f)};
+    const float in[2]={AxisInput(track,0,wantYaw,yaw,yawError,fullCircle),AxisInput(track,1,wantPitch,pitch,wantPitch-pitch,false)};
     if(!std::isfinite(in[0]) || !std::isfinite(in[1])){diag.stop="bad-input";return;}
     Put<float>(vehicle,kTurn,in[0]);Put<float>(vehicle,kTurn+4,in[1]);
     if(cfg.debug && now-track.loggedAt>500) {
         track.loggedAt=now;
-        Log("AIM fuse=%dm v=%p t=%p local=(%.1f,%.1f,%.1f) yaw=%.3f->%.3f pitch=%.3f->%.3f in=(%.2f,%.2f)",
-            static_cast<int>(std::sqrt(Dot(local,local))),vehicle,target,local[0],local[1],local[2],yaw,wantYaw,pitch,wantPitch,in[0],in[1]);
+        Log("AIM fuse=%dm v=%p t=%p local=(%.1f,%.1f,%.1f) yaw=%.3f->%.3f pitch=%.3f->%.3f in=(%.2f,%.2f) rate=(%.2f,%.2f)/s k=(%.2f,%.2f)/s speed=%.0fm/s",
+            static_cast<int>(std::sqrt(Dot(local,local))),vehicle,target,local[0],local[1],local[2],yaw,wantYaw,pitch,wantPitch,in[0],in[1],
+            track.rate[0]*60.0f,track.rate[1]*60.0f,track.k[0]*60.0f,track.k[1]*60.0f,std::sqrt(Dot(track.vel,track.vel))*60.0f);
     }
 }
 
@@ -579,6 +622,7 @@ void LoadConfig() noexcept {
     next.airHeight=ReadFloat(L"AirHeight",next.airHeight);
     next.lead=GetPrivateProfileIntW(L"AutoTurret",L"Lead",1,iniPath)!=0;
     next.trackRange=Clamp(ReadFloat(L"TrackRange",next.trackRange),0.0f,1.0f);
+    next.feedForward=GetPrivateProfileIntW(L"AutoTurret",L"FeedForward",1,iniPath)!=0;
     next.fuse=GetPrivateProfileIntW(L"AutoTurret",L"FuseToTarget",1,iniPath)!=0;
     next.fuseBias=ReadFloat(L"FuseBiasFrames",next.fuseBias);
     next.fuseMin=GetPrivateProfileIntW(L"AutoTurret",L"FuseMinFrames",next.fuseMin,iniPath);
@@ -586,9 +630,9 @@ void LoadConfig() noexcept {
     next.contact=GetPrivateProfileIntW(L"AutoTurret",L"ContactFuse",1,iniPath)!=0;
     next.burstVisual=Clamp(ReadFloat(L"BurstVisualScale",next.burstVisual),0.2f,10.0f);
     cfg=next;
-    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d track=%.2f fuse=%d%+.1f min=%d proximity=%.1f contact=%d",
+    Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d track=%.2f ff=%d fuse=%d%+.1f min=%d proximity=%.1f contact=%d",
         cfg.enabled,cfg.debug,cfg.gain,cfg.yawSign,cfg.yawOffset,cfg.pitchSign,cfg.pitchOffset,cfg.pivotHeight,
-        cfg.airHeight,cfg.lead,cfg.trackRange,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact);
+        cfg.airHeight,cfg.lead,cfg.trackRange,cfg.feedForward,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact);
 }
 
 FILETIME IniStamp() noexcept {
