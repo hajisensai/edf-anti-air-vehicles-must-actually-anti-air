@@ -36,7 +36,8 @@ jobs:
           New-Item -ItemType Directory -Force "$root/Mods/Plugins", "$root/tools", "$root/third_party" | Out-Null
           Copy-Item dist/Mods/Plugins/EDF6AutoTurret.dll, dist/Mods/Plugins/EDF6AutoTurret.ini "$root/Mods/Plugins/"
           Copy-Item tools/build.py, tools/describe.py, tools/dsgo.py, tools/gamefs.py "$root/tools/"
-          Copy-Item third_party/edf6-cpk "$root/third_party/" -Recurse
+          New-Item -ItemType Directory -Force "$root/third_party/edf6-cpk" | Out-Null
+          Copy-Item third_party/edf6-cpk/*.py, third_party/edf6-cpk/LICENSE "$root/third_party/edf6-cpk/"
           Copy-Item README.md, README.zh-CN.md, LICENSE $root
           Compress-Archive -Path "$root/*" -DestinationPath "build/$name.zip"
           "PACKAGE=$name" >> $env:GITHUB_ENV
