@@ -43,6 +43,12 @@ constexpr std::int32_t kModeWeaponRows=0;
 constexpr std::size_t kTurnStride=0x10;
 constexpr unsigned kGunnerSeats=3;          // driver + two gunners
 constexpr float kMuzzleReach=30.0f;         // a muzzle farther than this from the vehicle is garbage
+// The side guns turn far slower than the flak turret (~0.3 rad/s against ~1.1), so a fixed
+// stick-per-radian gain leaves them a second behind a tank that is driving. Their gain comes from
+// the learned turn rate instead: an error is asked to close in this many frames.
+constexpr float kSettleFrames=6.0f;
+constexpr float kHoldCone=2.0f;             // a firing gun keeps firing until it is this many cones off
+constexpr std::size_t kWeaponFire=0x139;    // the trigger 0x62C000 sets; the weapon update reads and clears it
 
 using InputFn=void(__fastcall*)(void*,std::uintptr_t);
 using TriggerFn=void(__fastcall*)(void*);
@@ -238,9 +244,11 @@ void LeadGun(const unsigned char* vehicle,const Gun& gun,Track& track,const void
 
 // The AI holds fire until the barrel is on the aim point (or within the target's blast size)
 // and never fires on something so close the round would hit the tank or its own blast would.
-bool OnTarget(const Gun& gun,const float* error,float distance) noexcept {
+// Once firing it holds the trigger through the wobble of a driving tank (`widen` cones), since the
+// weapon reads the trigger as held only while it is pulled every frame.
+bool OnTarget(const Gun& gun,const float* error,float distance,float widen) noexcept {
     const float size=gun.blast>1.5f ? gun.blast : 1.5f;
-    const float cone=std::fmax(cfg.gunnerCone,std::atan(size/std::fmax(distance,1.0f)));
+    const float cone=widen*std::fmax(cfg.gunnerCone,std::atan(size/std::fmax(distance,1.0f)));
     const float closest=std::fmax(cfg.gunnerMinDistance,1.5f*gun.blast);
     return std::fabs(error[0])<cone && std::fabs(error[1])<cone && distance>=closest;
 }
@@ -263,23 +271,33 @@ void SteerSeat(unsigned char* vehicle,unsigned s,Crew crew,float down) noexcept 
     const void* dropped=now<track.droppedUntil ? track.dropped : nullptr;
     float world[3],aimAt[3];
     const auto target=PickGunTarget(vehicle,gun,aim,track.target,dropped,world);
-    if(!target){track.target=nullptr;track.at=now;return;}
+    if(!target){track.target=nullptr;track.firing=false;track.at=now;return;}
     LeadGun(vehicle,gun,track,target,world,aimAt);
     track.at=now;
     float want[2],error[2],axis[2],time,distance;
-    if(!Solve(vehicle,gun,aimAt,want,time,distance) || !AxisTargets(aim,want,error,axis))return;
+    if(!Solve(vehicle,gun,aimAt,want,time,distance) || !AxisTargets(aim,want,error,axis)){track.firing=false;return;}
     for(int a=0;a<2;++a)axis[a]=Clamp(axis[a],aim.min[a],aim.max[a]);
-    const float in[2]={AxisInput(track,0,axis[0],aim.angle[0],axis[0]-aim.angle[0],false),
-                       AxisInput(track,1,axis[1],aim.angle[1],axis[1]-aim.angle[1],false)};
+    float in[2];
+    for(int a=0;a<2;++a) {
+        const float k=track.k[a]>0.0f ? track.k[a] : kTurnPerInput;
+        in[a]=AxisInput(track,a,axis[a],aim.angle[a],axis[a]-aim.angle[a],false,1.0f/(k*kSettleFrames));
+    }
     if(!AllFinite(in,2))return;
     Put<float>(vehicle,kTurn+s*kTurnStride,in[0]);Put<float>(vehicle,kTurn+s*kTurnStride+4,in[1]);
-    const bool fire=crew!=Crew::player && OnTarget(gun,error,distance);
-    if(fire)reinterpret_cast<TriggerFn>(image+kPullTrigger)(gun.trigger);
+    const bool fire=crew!=Crew::player && OnTarget(gun,error,distance,track.firing ? kHoldCone : 1.0f);
+    if(fire) {
+        // A pull the weapon has not read by the next frame means this gun is not being updated.
+        if(track.firing && gun.weapon[kWeaponFire])++track.stale;
+        ++track.pulls;
+        reinterpret_cast<TriggerFn>(image+kPullTrigger)(gun.trigger);
+    }
+    track.firing=fire;
     if(cfg.debug && now-track.loggedAt>500) {
         track.loggedAt=now;
-        Log("GUNNER v=%p seat=%u %s t=%p dist=%.0f flight=%.0ff barrel=(%.3f,%.3f) want=(%.3f,%.3f) axis=(%.3f,%.3f)->(%.3f,%.3f) sign=(%+.0f,%+.0f) in=(%.2f,%.2f) fire=%d",
+        Log("GUNNER v=%p seat=%u %s t=%p dist=%.0f flight=%.0ff barrel=(%.3f,%.3f) want=(%.3f,%.3f) axis=(%.3f,%.3f)->(%.3f,%.3f) sign=(%+.0f,%+.0f) k=(%.4f,%.4f) in=(%.2f,%.2f) fire=%d pulls=%u stale=%u",
             vehicle,s,crew==Crew::player?"player":"ai",target,distance,time,aim.barrel[0],aim.barrel[1],want[0],want[1],
-            aim.angle[0],aim.angle[1],axis[0],axis[1],aim.sign[0],aim.sign[1],in[0],in[1],fire);
+            aim.angle[0],aim.angle[1],axis[0],axis[1],aim.sign[0],aim.sign[1],track.k[0],track.k[1],in[0],in[1],fire,track.pulls,track.stale);
+        track.pulls=0;track.stale=0;
     }
 }
 

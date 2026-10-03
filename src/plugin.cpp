@@ -425,7 +425,7 @@ void Lead(const unsigned char* vehicle,Track& track,const void* target,const flo
 // Turret input for one axis: feed-forward at the wanted angle's own rate plus a correction on the
 // error. A pure proportional input lags a crossing target by rate/(gain x k), which put every
 // round behind the target.
-float AxisInput(Track& track,int a,float want,float angle,float error,bool wrap) noexcept {
+float AxisInput(Track& track,int a,float want,float angle,float error,bool wrap,float gain) noexcept {
     if(track.k[a]<=0.0f)track.k[a]=kTurnPerInput;
     if(track.frames>=1) {
         const float wanted=wrap ? Wrap(want-track.want[a]) : want-track.want[a];
@@ -437,7 +437,7 @@ float AxisInput(Track& track,int a,float want,float angle,float error,bool wrap)
         }
     } else track.rate[a]=0.0f;
     const float ff=cfg.feedForward ? track.rate[a]/track.k[a] : 0.0f;
-    const float in=Clamp(ff+error*cfg.gain,-1.0f,1.0f);
+    const float in=Clamp(ff+error*gain,-1.0f,1.0f);
     track.want[a]=want;track.axis[a]=angle;track.in[a]=in;
     return in;
 }
@@ -510,7 +510,7 @@ void Steer(unsigned char* vehicle) noexcept {
     wantPitch=Clamp(wantPitch,At<float>(axes+kAxisStride,kAxisMin),At<float>(axes+kAxisStride,kAxisMax));
     const bool fullCircle=At<float>(axes,kAxisMax)-At<float>(axes,kAxisMin)>=2*kPi-0.01f;
     const float yawError=fullCircle ? Wrap(wantYaw-yaw) : wantYaw-yaw;
-    const float in[2]={AxisInput(track,0,wantYaw,yaw,yawError,fullCircle),AxisInput(track,1,wantPitch,pitch,wantPitch-pitch,false)};
+    const float in[2]={AxisInput(track,0,wantYaw,yaw,yawError,fullCircle,cfg.gain),AxisInput(track,1,wantPitch,pitch,wantPitch-pitch,false,cfg.gain)};
     if(!std::isfinite(in[0]) || !std::isfinite(in[1])){diag.stop="bad-input";return;}
     Put<float>(vehicle,kTurn,in[0]);Put<float>(vehicle,kTurn+4,in[1]);
     if(cfg.debug && now-track.loggedAt>500) {

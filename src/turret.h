@@ -116,6 +116,9 @@ struct Track {
     float geo[2];
     float geoSign[2];      // 0 = not yet set
     bool geoValid;
+    bool firing;           // the AI held the trigger last frame
+    unsigned pulls;        // trigger pulls since the last log line
+    unsigned stale;        // ... of which the previous pull was still unread (the gun is not updating)
 };
 
 // A gun's round as the aim sees it: muzzle speed (m/frame), the drop it picks up along the
@@ -142,7 +145,7 @@ bool Finite(const unsigned char* base,std::size_t offset,float* out) noexcept;
 void ScanEnemies(const unsigned char* vehicle,float range) noexcept;
 float Down(const unsigned char* vehicle) noexcept;
 bool Ballistic(const float* local,const Shot& shot,float& elevation,float& time) noexcept;
-float AxisInput(Track& track,int a,float want,float angle,float error,bool wrap) noexcept;
+float AxisInput(Track& track,int a,float want,float angle,float error,bool wrap,float gain) noexcept;
 bool Matches(std::size_t rva,const unsigned char* bytes,std::size_t size) noexcept;
 bool PatchVtableSlot(void** slot,void* expected,void* replacement) noexcept;
 void ReloadConfigIfChanged() noexcept;
