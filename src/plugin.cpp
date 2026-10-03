@@ -20,6 +20,7 @@
 #include "PluginAPI.h"
 #pragma warning(pop)
 #include "memory.h"
+#include "turret.h"
 
 namespace autoturret {
 unsigned char* image=nullptr;
@@ -27,71 +28,10 @@ HMODULE module=nullptr;
 wchar_t logPath[MAX_PATH]{};
 wchar_t iniPath[MAX_PATH]{};
 
-struct Config {
-    bool enabled=true;
-    bool debug=false;
-    float gain=3.0f;           // stick input per radian of aim error, clamped to +-1
-    float yawSign=1.0f;        // axis angle = sign * geometric angle + offset
-    float yawOffset=0.0f;
-    float pitchSign=-1.0f;     // the pitch axis is negative-up (Kepler: -60 deg up .. +5 deg down)
-    float pitchOffset=0.0f;
-    float pivotHeight=2.5f;    // turret pivot above the vehicle origin, metres
-    float airHeight=12.0f;     // a target this far above the pivot counts as air
-    bool lead=true;            // aim ahead of moving targets, using the gun's own AmmoSpeed
-    float trackRange=0.75f;    // auto-aim only at targets within this share of the gun's range
-    bool feedForward=true;     // drive the turret at the aim point's own angular rate, not only on the error
-    float slewWeight=250.0f;   // metres a new target may be farther per radian it saves the turret turning
-    float dragDeadzone=0.3f;   // aim stick past this aims by hand while held (0 = never)
-    DWORD dragDropMs=3000;     // the target dragged away from is not picked again for this long
-    bool fuse=true;            // set each round's lifetime (its burst point) to the target's range
-    float fuseBias=0.0f;       // frames added to the computed fuse
-    int fuseMin=4;             // never burst closer than this many frames
-    float proximity=5.0f;      // burst when a round passes this close to a target (0 = off); keep below AmmoExplosion
-    bool contact=true;         // burst the moment a round sticks to something or stops
-    float burstVisual=2.5f;    // burst effect size as a multiple of the stock one (AmmoExplosion/5)
-};
 Config cfg{};
 FILETIME iniStamp{};
 ULONGLONG iniCheckedAt=0;
 
-// --- EDF.dll layout ---
-constexpr unsigned kFlakVtable=0x17DC620,kFlakInput=0x621460;   // Vehicle603_Flak, slot 55
-constexpr std::size_t kInputSlot=55;
-// Vehicle
-constexpr std::size_t kMatrix=0x60,kPosition=0x90,kDead=0x2E8,kSeats=0x608,kSeatCount=0x618,kTurn=0x2AA0;
-// Seat (stride 0x340): weapon holders, aim controller, rider stick
-constexpr std::size_t kSeatStride=0x340,kSeatWeapons=0xC8,kSeatWeaponCount=0xD8,kSeatAim=0xE0,kStick=0x2D0;
-constexpr std::size_t kHolderWeapon=0x10;
-// VehicleWeaponAim: axes at +0x10, stride 0x40; {min, max, angle, velocity, ...}
-constexpr std::size_t kAimAxes=0x10,kAxisStride=0x40,kAxisMin=0x0,kAxisMax=0x4,kAxisAngle=0x8;
-// Weapon: lock-on profile (LockonType 4 marks our guns)
-// LockonTargetType 1 marks a ground-attack gun: our guns never lock (LockonRange 0), and the only
-// stock reader (0x696792) just picks the lock class from it.
-constexpr std::size_t kLockonType=0x6B0,kLockonTargetType=0x6B4;
-constexpr std::int32_t kOurLockonType=4,kGroundTargetType=1;
-// Weapon ammo parameters, copied into each round when it is fired; speed is metres per frame
-constexpr std::size_t kAmmoSpeed=0x894,kAmmoAlive=0x898,kAmmoGravity=0x8E0;
-// The round factory AmmoClass resolved to (0x68D53A); fire (0x6970A5) spawns rounds through it.
-// Only GrenadeBullet01 rounds can be fused, so only guns with its factory get a time fuse.
-constexpr std::size_t kAmmoFactory=0x7F8;
-constexpr unsigned kGrenadeFactoryVtable=0x17A1688;
-// World gravity: *(global)+0x68 is the physics world; its object at +0x20 returns the gravity
-// vector (m/s^2) from virtual slot 0. The game's own vehicle aim (0x622706) reads it this way and
-// drops a round by AmmoGravityFactor x gravity / 3600 metres per frame^2 (0x622B65).
-constexpr std::size_t kWorld=0x20B2958,kWorldPhysics=0x68,kPhysicsGravity=0x20;
-constexpr float kFramesPerSecondSq=3600.0f;
-// Lock-target registry: global pointer -> object holding std::list<{raw T*, weak_ptr}> at +8.
-// Each T is one lock point of an object: +0 kind (0 = enemy kind), +8 the object, +0x10 its aim
-// point (rewritten every frame from the bone matrix by 0x6C7700), +0x29 valid, +0x2A lockable.
-// The lock query (0x696710) walks the same list; it is only touched on the game thread.
-constexpr std::size_t kRegistry=0x20B2AB0,kRegList=0x8,kNodeTarget=0x10;
-constexpr std::size_t kTargetObject=0x8,kTargetAim=0x10,kTargetValid=0x29,kTargetLockable=0x2A;
-// Team relations: manager -> array (stride 0x38) per team -> int relation[team]; 2 = enemy.
-constexpr std::size_t kTeams=0x20B2978,kTeamArray=0x38,kTeamStride=0x38,kTeamRelation=0x18;
-constexpr std::size_t kTeam=0x314;
-constexpr std::int32_t kEnemyRelation=2,kMaxTeam=64;
-constexpr int kMaxEnemies=256,kMaxNodes=8192;
-constexpr float kPi=3.14159265f;
 
 using InputFn=void(__fastcall*)(void*,std::uintptr_t);
 InputFn originalInput=nullptr;
@@ -129,37 +69,11 @@ Round rounds[kMaxRounds]{};
 int roundNext=0;
 SRWLOCK roundLock=SRWLOCK_INIT;
 
-// Lock points of every enemy within gun range, sampled in the vehicle input phase that runs
-// before the bullet update phase of the same frame. One enemy can own several entries.
-struct Enemy { const void* object; float pos[3]; float origin[3]; };
-constexpr ULONGLONG kEnemyMs=150;
 Enemy enemies[kMaxEnemies]{};
 int enemyCount=0;
 ULONGLONG enemiesAt=0;
 
-// The turret axes turn at (input x k) rad per frame; measured from the log at ~1.1 rad/s for a
-// full input on both axes, and refined online from how far each axis actually moved.
-constexpr float kPitchMargin=0.03f;   // rad past a pitch stop still counted as reachable
-constexpr float kTurnPerInput=1.1f/60.0f,kTurnPerInputMin=0.2f/60.0f,kTurnPerInputMax=6.0f/60.0f;
-
-struct Track {
-    const void* vehicle;
-    const void* target;
-    float last[3];
-    float vel[3];          // smoothed target velocity, metres per frame
-    int frames;            // consecutive frames on this target
-    float want[2];         // last wanted yaw/pitch
-    float rate[2];         // smoothed change of the wanted angles, rad per frame
-    float axis[2];         // last yaw/pitch angle
-    float in[2];           // last input written
-    float k[2];            // learned rad per frame per unit input
-    bool dragging;         // the rider is aiming by hand
-    const void* dropped;   // target dragged away from
-    ULONGLONG droppedUntil;
-    ULONGLONG at;          // last update tick
-    ULONGLONG loggedAt;
-};
-Track tracks[8]{};
+Track tracks[32]{};   // flak vehicles and tank gunner seats
 
 // Once-a-second snapshot of where Steer stopped, for Debug=1.
 struct Diag {
@@ -172,9 +86,6 @@ struct Diag {
 };
 Diag diag{};
 
-// A gun's round as the aim sees it: muzzle speed (m/frame), the drop it picks up along the
-// vehicle's down axis (m/frame^2), and whether the gun hunts ground targets first.
-struct Shot { float speed; float drop; bool ground; };
 
 // Data AmmoAlive per gun, so the fuse can return to max range when nothing is tracked.
 struct Fuse { const void* weapon; std::int32_t alive; };
@@ -188,20 +99,6 @@ void Log(const char* format,...) noexcept {
     fprintf(f,"[%02u:%02u:%02u] %s\r\n",t.wHour,t.wMinute,t.wSecond,text);fclose(f);
 }
 
-template<class T> T At(const void* base,std::size_t offset) noexcept {
-    T value;std::memcpy(&value,static_cast<const unsigned char*>(base)+offset,sizeof(T));return value;
-}
-template<class T> void Put(void* base,std::size_t offset,T value) noexcept {
-    std::memcpy(static_cast<unsigned char*>(base)+offset,&value,sizeof(T));
-}
-
-float Dot(const float* a,const float* b) noexcept { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
-float Clamp(float v,float lo,float hi) noexcept { return v<lo?lo:(v>hi?hi:v); }
-float Wrap(float a) noexcept {
-    while(a>kPi)a-=2*kPi;
-    while(a<-kPi)a+=2*kPi;
-    return a;
-}
 
 Track& TrackFor(const void* vehicle) noexcept {
     Track* slot=&tracks[0];
@@ -306,7 +203,6 @@ void __fastcall SpawnHook(void* weapon,void* bullet) {
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-bool PatchVtableSlot(void** slot,void* expected,void* replacement) noexcept;
 
 // Route the gun class's "round spawned" slot through SpawnHook, once per vtable.
 void HookSpawn(const unsigned char* weapon) noexcept {
@@ -625,8 +521,6 @@ void Steer(unsigned char* vehicle) noexcept {
     }
 }
 
-void ReloadConfigIfChanged() noexcept;
-
 void FlushDiag(const void* vehicle) noexcept {
     const auto now=GetTickCount64();
     if(!cfg.debug || now-diag.at<1000)return;
@@ -652,7 +546,8 @@ bool Matches(std::size_t rva,const unsigned char* bytes,std::size_t size) noexce
     return std::memcmp(image+rva,bytes,size)==0;
 }
 
-bool CheckProfile(HMODULE handle) noexcept {
+// The one EDF.dll build every address here is for.
+bool IdentifyImage(HMODULE handle) noexcept {
     __try {
         auto base=reinterpret_cast<unsigned char*>(handle);
         if(!Readable(base,0x1000))return false;
@@ -662,6 +557,13 @@ bool CheckProfile(HMODULE handle) noexcept {
         if(pe->Signature!=IMAGE_NT_SIGNATURE || pe->FileHeader.Machine!=IMAGE_FILE_MACHINE_AMD64
            || pe->FileHeader.TimeDateStamp!=0x678CCB46 || pe->OptionalHeader.SizeOfImage!=0x22CE000)return false;
         image=base;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){image=nullptr;return false;}
+}
+
+// The flak's code, unpatched by anyone else.
+bool CheckProfile() noexcept {
+    __try {
         const unsigned char input[]={0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x0F,0xB6,0xDA};
         const unsigned char stick[]={0xF3,0x0F,0x10,0x83,0xD0,0x02,0x00,0x00};   // movss xmm0,[rbx+2D0]
         const unsigned char turn[]={0xF3,0x0F,0x11,0x87,0xA0,0x2A,0x00,0x00};    // movss [rdi+2AA0],xmm0
@@ -671,9 +573,8 @@ bool CheckProfile(HMODULE handle) noexcept {
             && Matches(0x6214E7,turn,sizeof(turn)) && Matches(0x621872,apply,sizeof(apply))
             && Matches(0x68D124,lockType,sizeof(lockType))
             && reinterpret_cast<void**>(image+kFlakVtable)[kInputSlot]==image+kFlakInput;
-        if(!ok)image=nullptr;
         return ok;
-    } __except(EXCEPTION_EXECUTE_HANDLER){image=nullptr;return false;}
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
 
 // Weapon fire-start (0x690BB0) refuses to fire a lock-on weapon with an empty lock list unless
@@ -751,10 +652,19 @@ void LoadConfig() noexcept {
     next.proximity=ReadFloat(L"ProximityRadius",next.proximity);
     next.contact=GetPrivateProfileIntW(L"AutoTurret",L"ContactFuse",1,iniPath)!=0;
     next.burstVisual=Clamp(ReadFloat(L"BurstVisualScale",next.burstVisual),0.2f,10.0f);
+    next.gunnerAi=GetPrivateProfileIntW(L"AutoTurret",L"GunnerAI",1,iniPath)!=0;
+    next.gunnerAssist=GetPrivateProfileIntW(L"AutoTurret",L"GunnerAssist",1,iniPath)!=0;
+    next.gunnerRange=Clamp(ReadFloat(L"GunnerRange",next.gunnerRange),10.0f,3000.0f);
+    next.gunnerCone=Clamp(ReadFloat(L"GunnerCone",next.gunnerCone),0.001f,0.5f);
+    next.gunnerMinDistance=Clamp(ReadFloat(L"GunnerMinDistance",next.gunnerMinDistance),0.0f,500.0f);
+    next.gunnerYawSign=ReadFloat(L"GunnerYawSign",next.gunnerYawSign)>=0.0f ? 1.0f : -1.0f;
+    next.gunnerPitchSign=ReadFloat(L"GunnerPitchSign",next.gunnerPitchSign)>=0.0f ? 1.0f : -1.0f;
     cfg=next;
     Log("CONFIG enabled=%d debug=%d gain=%.2f yaw=%.0f%+.3f pitch=%.0f%+.3f pivot=%.1f air=%.1f lead=%d track=%.2f ff=%d slew=%.0f drag=%.2f/%lums fuse=%d%+.1f min=%d proximity=%.1f contact=%d",
         cfg.enabled,cfg.debug,cfg.gain,cfg.yawSign,cfg.yawOffset,cfg.pitchSign,cfg.pitchOffset,cfg.pivotHeight,
         cfg.airHeight,cfg.lead,cfg.trackRange,cfg.feedForward,cfg.slewWeight,cfg.dragDeadzone,cfg.dragDropMs,cfg.fuse,cfg.fuseBias,cfg.fuseMin,cfg.proximity,cfg.contact);
+    Log("CONFIG gunners ai=%d assist=%d range=%.0f cone=%.3f min=%.0f sign=(%+.0f,%+.0f)",
+        cfg.gunnerAi,cfg.gunnerAssist,cfg.gunnerRange,cfg.gunnerCone,cfg.gunnerMinDistance,cfg.gunnerYawSign,cfg.gunnerPitchSign);
 }
 
 FILETIME IniStamp() noexcept {
@@ -782,18 +692,24 @@ extern "C" __declspec(dllexport) bool EDFMLAPI EML6_Load(PluginInfo* info) {
     wcscpy_s(dot,MAX_PATH-(dot-iniPath),L".ini");
     wcscpy_s(logPath,iniPath);
     dot=wcsrchr(logPath,L'.');wcscpy_s(dot,MAX_PATH-(dot-logPath),L".log");
-    info->infoVersion=PluginInfo::MaxInfoVer;info->name="EDF6 Auto Turret";info->version=PLUG_VER(0,1,0,0);
-    Log("EDF6AutoTurret 0.1.0 loading");
+    info->infoVersion=PluginInfo::MaxInfoVer;info->name="EDF6 Auto Turret";info->version=PLUG_VER(0,2,0,0);
+    Log("EDF6AutoTurret 0.2.0 loading");
     iniStamp=IniStamp();
     LoadConfig();
-    if(!CheckProfile(GetModuleHandleW(L"EDF.dll"))){Log("REFUSED: unsupported EDF.dll or conflicting patch");return false;}
-    originalInput=reinterpret_cast<InputFn>(image+kFlakInput);
-    auto slot=reinterpret_cast<void**>(image+kFlakVtable)+kInputSlot;
-    const bool hooked=PatchVtableSlot(slot,reinterpret_cast<void*>(originalInput),reinterpret_cast<void*>(&HookInput));
-    const bool gate=PatchFireGate();
-    Log("HOOK flak input slot=%d fire-gate(type4 free fire)=%d",hooked,gate);
-    HookGrenade();
-    return hooked;  // never unload code a patched slot points at
+    if(!IdentifyImage(GetModuleHandleW(L"EDF.dll"))){Log("REFUSED: unsupported EDF.dll");return false;}
+    // The flak and the tank gunners stand alone: either one's code being patched by someone else
+    // leaves only that one stock.
+    bool hooked=false;
+    if(CheckProfile()) {
+        originalInput=reinterpret_cast<InputFn>(image+kFlakInput);
+        auto slot=reinterpret_cast<void**>(image+kFlakVtable)+kInputSlot;
+        hooked=PatchVtableSlot(slot,reinterpret_cast<void*>(originalInput),reinterpret_cast<void*>(&HookInput));
+        const bool gate=PatchFireGate();
+        Log("HOOK flak input slot=%d fire-gate(type4 free fire)=%d",hooked,gate);
+        HookGrenade();
+    } else Log("HOOK flak: unexpected layout or conflicting patch, flak off");
+    const bool gunners=HookGunners();
+    return hooked || gunners;  // never unload code a patched slot points at
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance,DWORD reason,LPVOID) {

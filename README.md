@@ -13,6 +13,10 @@ It has two parts:
   round's ballistic arc and drives the turret with feed-forward so rounds stop trailing crossing
   targets. Flak rounds get a time fuse at the target's range, a proximity fuse and a contact fuse.
   Hold the aim stick to aim by hand; let go and the turret takes over again.
+  It also crews the **side guns of the Titan and of the Ranger's gunner-seat tanks**: an empty
+  gunner seat (or one an NPC sits in) aims and fires its gun by itself, on player- and NPC-driven
+  tanks alike; a player in a gunner seat gets the auto-aim and keeps the trigger. This part needs
+  no weapon files and works on the stock vehicles.
 - **Weapon data** overriding the stock vehicles' own files. No weapon rows are added. The
   vehicles' descriptions in `WEAPONTEXT` are rewritten with the new numbers; only their own rows
   change, on top of whatever tables are already in `Mods`, so mods that edit the tables keep theirs.
@@ -24,6 +28,8 @@ It has two parts:
 | KG6 Kepler, E, F, YE, YF | Flak: exploding rounds (8 m blast), proximity / time / contact fuses, 480 m range. Half the fire rate at twice the damage per round (same damage per second on paper, half the bursts on screen). Durability x2. DLC YF-HV turret speed. Air targets first. |
 | KG6 Kepler YF-HV (DLC) | Auto-aim only; keeps its high-velocity solid shot, durability and turret. |
 | KG7 Bohr, Bohr B (DLC) | Auto-aim in ground mode: ground targets first, lobbed rounds aimed on their arc, stock impact fuse. Durability x2, blast 4 m -> 6 m, and the blasts now wreck buildings. |
+| Titan (all, incl. DLC side cannons) | Plugin only: both side cannons aim themselves; with no player in a gunner seat they also fire. Main cannon untouched. |
+| Ranger tanks with gunner seats (Vehicle403) | Plugin only: both side machine guns, as above. Single-seat tanks (Air Raider's, Vehicle601) have no side guns. |
 
 Why: the stock Keplers deal a third to a half of the damage per second of same-level tanks and
 helicopters, with under half their durability, and the shortest range of any of them. The Bohr
@@ -66,6 +72,10 @@ The DLL lands in `dist\Mods\Plugins\`. CI builds it on every push.
 
 Built against EDF.dll with TimeDateStamp `0x678CCB46`. The plugin checks the code it patches and
 turns itself off if the game has changed.
+
+The tank gunners are checked against the game code but have not been tested in a running game yet:
+treat them as experimental, and send a `Debug=1` log if a side gun misbehaves. In co-op, a remote
+player in a gunner seat may look like an empty seat to your machine, so set `GunnerAI=0` online.
 
 Online play is untested. The mod adds no weapon rows, so players without it never meet a row they
 do not have; but each machine simulates the vehicles from its own files, so in a mixed lobby the

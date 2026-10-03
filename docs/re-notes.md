@@ -22,6 +22,34 @@ runs. Turret rate is about 1.1–1.3 rad/s per unit input with the DLC turret pa
 `[65, 0.3, 0.3]`; the plugin learns the real rate per axis online. Pitch is negative-up
 (-1.047 .. +0.087).
 
+## Vehicle403_Tank / Vehicle404_Tank (Ranger gunner-seat tanks / Titan): the side guns
+
+`src/gunner.cpp` checks its own byte list (`CheckGunnerProfile`); a mismatch leaves only the tanks stock.
+
+| What | Where |
+|---|---|
+| vtables | 403 `0x17D8FA0`, 404 `0x17D9458` (both `Vehicle_TankBase`); slot 55 = input `0x5FEBE0` / `0x5FFC50` (hooked) |
+| seats | 0 driver (main cannon), 1 GUNNER_L, 2 GUNNER_R; same seat layout as the flak |
+| turn input of seat i | `+0x2AA0 + i*0x10` (yaw, pitch); slot 55 writes `(-stick.x, stick.y)`, or zeroes all three with no input |
+| apply | slot 4 (403 `0x5FEE90`, 404 `0x5FFFC0`) feeds every seat's turn input to its `seat+0xE0` aim controller, unconditionally |
+| triggers | `+0x638` array, `+0x648` count, stride `0x48`; `+8` weapon weak_ptr ctrl, `+0x10` weapon. Trigger i = seat i's gun (404: i+3 = its secondary weapon) |
+| pull trigger | `0x62C000(trigger)`: if the weapon is alive, `weapon+0x139 = 1` (fire this frame); what slot 55 calls on the fire button (`seat+0x2E4` past threshold) |
+| seat rider | `seat+0x260` object, `+0x268` weak_ptr ctrl (stored by `0x63407F`); occupied while the ctrl's use count is non-zero |
+| player rider | rider `+0x340` (pad) set and `+0x354` (player-controlled) on: the test the human code makes before copying its pad into its seat (`0x572EFF`) and the vehicle makes before reading a pad (`0x673AC2`). NPC soldiers and the `DummyVehicleRider` (vtable `0x17D7320`, seated by `0x633030`, slot 50) fail it |
+
+Muzzles (fire builds them at `0x6969A0`): weapon `+0x1D0` array, `+0x1E0` count, stride `0xF0`.
+Muzzle `+0` bone (world rows right/up/forward/position at `+0xB0..+0xEF`, live every frame), `+0x10`
+local 4x4, `+0xE0` mode. Mode 0: rotation = the weapon's world rows `weapon+0x150` (copied from its
+aim bone every frame by `0x633DD0`); mode 1: local x bone. Position = row 3 of local x bone in both.
+The round leaves along row 2 (`0x69168B` reads `+0x70` of the built matrix). The muzzle is only
+rebuilt when firing, so the plugin rebuilds it every frame itself.
+
+Game data: the Titan's side cannons are subCannon (RocketBullet01, 4 m/f, 600 f, gravity 2.0, blast
+8 m), subCannonSolid (SolidBullet01Rail, 6 m/f, 150 f, gravity 1.0) or the DLC meltCannon
+(AcidBullet01, 2 m/f, 300 f); roll axes -3..180 deg (left) / -180..3 deg (right), aim -30..12 deg. The
+403's side guns are SolidBullet01 machine guns (6 m/f, 35 f, no gravity), roll -5..160 / -160..5 deg.
+None reloads (ReloadTime -1).
+
 ## Weapon (fields filled from the SGO at `0x68D4A0`)
 
 | Field | Offset |
